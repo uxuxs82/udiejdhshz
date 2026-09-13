@@ -21,8 +21,9 @@ const TARGET_DEMOS = 15;
 const MAX_COLLECT_MS = 10 * 60 * 1000;
 const TRAIN_PER_DEMO_MS = 120 * 1000;
 
-const RL_LR = 0.001;
-const PRETRAIN_LR = 0.002;
+// ===== БЫСТРОЕ ОБУЧЕНИЕ =====
+const RL_LR = 0.003;         // было 0.001 — в 3 раза быстрее
+const PRETRAIN_LR = 0.005;   // было 0.002 — в 2.5 раза быстрее
 const SPEED = 2.5;
 const MAX_TURN = 0.12;
 const SUBSTEPS = 6;
@@ -30,18 +31,17 @@ const JUMP_H = 1.2;
 const JUMP_DUR = 0.5;
 const EPISODE_STEPS = 1500;
 const STEP_SLEEP = 6;
-const FINISH_RADIUS = 10;   // ±10 до финиша = финиш
+const FINISH_RADIUS = 3;
 
-// ====== ТОП / РЕКОРДЫ ======
 const STATE_FILE = "top_state.json";
 const AUTO_CHECK_MS = 5 * 60 * 1000;
 const RECORD_FILE = "best_record.txt";
 
-let STATE = { bestSent: 999, lastSent: 0, lastCheck: 0 };
+let STATE = { bestSent: 999, lastSent: 0 };
 try { STATE = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8")); } catch (e) {}
 function saveState() { try { fs.writeFileSync(STATE_FILE, JSON.stringify(STATE)); } catch (e) {} }
 
-let BEST_TIME = 999;   // лучший результат за всё время (локально)
+let BEST_TIME = 999;
 try {
   const n = parseFloat(fs.readFileSync(RECORD_FILE, "utf-8").trim());
   if (!isNaN(n)) BEST_TIME = n;
@@ -160,10 +160,6 @@ async function sendRecord(time) {
   try { ws.close(); } catch (e) {}
 }
 
-// Возвращает:
-//   { status: "in_top", topTime: X }  — наш ник в топе
-//   { status: "empty", topTime: null } — топа нет / не наш
-//   { status: "err", msg }             — ошибка запроса
 async function checkTop() {
   let top = [];
   try { top = await fetchScores(MAP_ROOM); }
@@ -187,12 +183,12 @@ async function autoCheck() {
   try {
     const now = Date.now();
     if (BEST_TIME >= 999) {
-      console.log("[AUTO] пока нет локального финиша — нечего отправлять");
+      console.log("[AUTO] нет локального финиша — нечего отправлять");
       autoCheckRunning = false;
       return;
     }
 
-    console.log("[AUTO] проверка топа | локальный лучший: " + BEST_TIME.toFixed(3) + "c | отправленный: " + (STATE.bestSent === 999 ? "—" : STATE.bestSent.toFixed(3) + "c"));
+    console.log("[AUTO] проверка топа | локальный: " + BEST_TIME.toFixed(3) + "c | отправленный: " + (STATE.bestSent === 999 ? "—" : STATE.bestSent.toFixed(3) + "c"));
 
     const res = await checkTop();
     if (res.status === "err") {
@@ -202,31 +198,29 @@ async function autoCheck() {
     }
 
     if (res.status === "in_top") {
-      console.log("[AUTO] наш ник в топе (" + res.topTime.toFixed(3) + "c) — не засоряем, ждём пока исчезнет");
+      console.log("[AUTO] наш ник в топе (" + res.topTime.toFixed(3) + "c) — ждём пока исчезнет");
       autoCheckRunning = false;
       return;
     }
 
-    // В топе нас нет — можно отправить
     if (BEST_TIME >= STATE.bestSent) {
-      console.log("[AUTO] новый рекорд (" + BEST_TIME.toFixed(3) + ") не лучше отправленного (" + STATE.bestSent.toFixed(3) + ") — пропуск");
+      console.log("[AUTO] новый (" + BEST_TIME.toFixed(3) + ") не лучше отправленного (" + STATE.bestSent.toFixed(3) + ") — пропуск");
       autoCheckRunning = false;
       return;
     }
 
-    console.log("[AUTO] отправляем новый рекорд: " + BEST_TIME.toFixed(3) + "c (было " + (STATE.bestSent === 999 ? "—" : STATE.bestSent.toFixed(3)) + ")");
+    console.log("[AUTO] отправляем: " + BEST_TIME.toFixed(3) + "c");
     await sendRecord(BEST_TIME);
     STATE.bestSent = BEST_TIME;
     STATE.lastSent = now;
     saveState();
-    console.log("[AUTO] отправлено. Следующая проверка через 5 минут");
+    console.log("[AUTO] отправлено. Проверка через 5 минут");
   } catch (e) {
     console.log("[AUTO] err: " + e.message);
   }
   autoCheckRunning = false;
 }
 
-// ====== СБОР ДЕМОК ======
 async function collectDemos() {
   const dir = "demos/" + MAP_ID;
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -280,7 +274,6 @@ async function collectDemos() {
   return have;
 }
 
-// ====== СЕТЬ ======
 const IN = 10, H1 = 64, H2 = 32, OUT = 2;
 function rnd(){ return (Math.random()-0.5)*0.3; }
 function zeros(a){ return Array.isArray(a[0]) ? a.map(r => r.map(()=>0)) : a.map(()=>0); }
@@ -312,9 +305,9 @@ const V = { W1:zeros(W.W1), B1:zeros(W.B1), W2:zeros(W.W2), B2:zeros(W.B2), W3:z
 function loadMap() {
   const dir = "demos/" + MAP_ID;
   W.demos = []; W.safe = new Set(); W.ymap = {};
-  if (!fs.existsSync(dir)) return false;
+  if (!fs.existsSync(dir)) { console.log("нет папки"); return false; }
   const files = fs.readdirSync(dir).filter(f => f.endsWith(".gz"));
-  if (!files.length) return false;
+  if (!files.length) { console.log("нет демок"); return false; }
 
   for (const f of files) {
     try {
@@ -328,19 +321,59 @@ function loadMap() {
       W.demos.push({ path: p, time: p[p.length-1].t, nick: d.nick || f });
     } catch (e) {}
   }
-  if (!W.demos.length) return false;
+  if (!W.demos.length) { console.log("не распарсились"); return false; }
 
-  const longest = W.demos.reduce((a,b) => a.path.length > b.path.length ? a : b);
-  W.spawn = longest.path[0];
-  const fastest = W.demos.reduce((a,b) => a.time < b.time ? a : b);
-  W.finish = fastest.path[fastest.path.length - 1];
+  const CLUSTER_R = 5;
+  function findConsensus(points) {
+    let bestIdx = 0, bestCount = 0;
+    for (let i = 0; i < points.length; i++) {
+      let count = 0;
+      for (let j = 0; j < points.length; j++) {
+        const d = Math.hypot(points[i].x - points[j].x, points[i].z - points[j].z);
+        if (d < CLUSTER_R) count++;
+      }
+      if (count > bestCount) { bestCount = count; bestIdx = i; }
+    }
+    const cluster = [];
+    for (const p of points) {
+      const d = Math.hypot(points[bestIdx].x - p.x, points[bestIdx].z - p.z);
+      if (d < CLUSTER_R) cluster.push(p);
+    }
+    const avgX = cluster.reduce((s,p)=>s+p.x, 0) / cluster.length;
+    const avgY = cluster.reduce((s,p)=>s+p.y, 0) / cluster.length;
+    const avgZ = cluster.reduce((s,p)=>s+p.z, 0) / cluster.length;
+    return { x: avgX, y: avgY, z: avgZ, count: bestCount, total: points.length };
+  }
+
+  const starts = W.demos.map(d => d.path[0]);
+  const ends = W.demos.map(d => d.path[d.path.length-1]);
+  const spawnC = findConsensus(starts);
+  const finishC = findConsensus(ends);
+
+  W.spawn = { x: spawnC.x, y: spawnC.y, z: spawnC.z };
+  W.finish = { x: finishC.x, y: finishC.y, z: finishC.z };
+
+  console.log("[" + MAP_ID + "] СПАВН: " + spawnC.count + "/" + spawnC.total + " → (" + W.spawn.x.toFixed(1) + "," + W.spawn.z.toFixed(1) + ")");
+  console.log("[" + MAP_ID + "] ФИНИШ: " + finishC.count + "/" + finishC.total + " → (" + W.finish.x.toFixed(1) + "," + W.finish.z.toFixed(1) + ")");
+  const distSF = Math.hypot(W.finish.x - W.spawn.x, W.finish.z - W.spawn.z);
+  console.log("[" + MAP_ID + "] дистанция: " + distSF.toFixed(1) + "м");
+
+  const before = W.demos.length;
+  const badDemos = [];
+  W.demos = W.demos.filter(d => {
+    const dStart = Math.hypot(d.path[0].x - W.spawn.x, d.path[0].z - W.spawn.z);
+    const dEnd = Math.hypot(d.path[d.path.length-1].x - W.finish.x, d.path[d.path.length-1].z - W.finish.z);
+    if (dStart > 15 || dEnd > 15) { badDemos.push(d.nick); return false; }
+    return true;
+  });
+  console.log("[" + MAP_ID + "] битых отброшено: " + badDemos.length + " / " + before);
+  console.log("[" + MAP_ID + "] чистых: " + W.demos.length);
 
   for (const d of W.demos) for (const fr of d.path) {
     const k = Math.round(fr.x) + "," + Math.round(fr.z);
     W.safe.add(k);
     if (W.ymap[k] === undefined) W.ymap[k] = fr.y;
   }
-  console.log("[" + MAP_ID + "] " + W.demos.length + " демок | spawn(" + W.spawn.x.toFixed(1) + "," + W.spawn.z.toFixed(1) + ") | finish(" + W.finish.x.toFixed(1) + "," + W.finish.z.toFixed(1) + ")");
   return true;
 }
 
@@ -471,7 +504,7 @@ function saveWeights() {
 
 function rlUpdate(steps, reward, lr) {
   if (!steps.length) return;
-  const scale = Math.sign(reward) * Math.min(Math.abs(reward), 0.5);
+  const scale = Math.sign(reward) * Math.min(Math.abs(reward), 0.7);  // было 0.5 — сильнее сигнал
   for (let i=0; i<steps.length; i++) {
     const decay = Math.pow(0.995, steps.length - i);
     backprop(steps[i].inp, steps[i].action, lr, scale * decay);
@@ -536,6 +569,8 @@ async function runBot() {
     await sleep(50);
     emit(ws, "connectToRoom", MAP_ROOM);
     await sleep(100);
+
+    const minTravel = Math.hypot(W.finish.x - W.spawn.x, W.finish.z - W.spawn.z) * 0.7;
 
     let step = 0, done = false, fell = false;
     while (step < EPISODE_STEPS && ws.readyState === 1) {
@@ -633,7 +668,8 @@ async function runBot() {
       lastDist = dNow;
 
       const dist3 = Math.hypot(pos.x - W.finish.x, pos.y - W.finish.y, pos.z - W.finish.z);
-      if (dist3 < FINISH_RADIUS) { done = true; break; }   // ±10 до финиша
+      const distFromSpawn = Math.hypot(pos.x - W.spawn.x, pos.z - W.spawn.z);
+      if (dist3 < FINISH_RADIUS && distFromSpawn > minTravel) { done = true; break; }
       step++;
     }
     try { ws.close(); } catch (e) {}
@@ -645,27 +681,26 @@ async function runBot() {
 }
 
 (async () => {
-  console.log("=== uxuxx ai SOLO — " + MAP_ID + " — с отправкой рекордов ===");
-  console.log("Локальный лучший: " + (BEST_TIME === 999 ? "—" : BEST_TIME.toFixed(3) + "c"));
-  console.log("Уже отправленный: " + (STATE.bestSent === 999 ? "—" : STATE.bestSent.toFixed(3) + "c") + "\n");
+  console.log("=== uxuxx ai SOLO — " + MAP_ID + " — ускоренное обучение ===\n");
+  console.log("Локальный: " + (BEST_TIME === 999 ? "—" : BEST_TIME.toFixed(3) + "c"));
+  console.log("Отправленный: " + (STATE.bestSent === 999 ? "—" : STATE.bestSent.toFixed(3) + "c") + "\n");
 
-  console.log("=== ЭТАП 1: СБОР ДЕМОК ===");
+  console.log("=== ЭТАП 1: СБОР ДЕМОК (до 15, макс 10 мин) ===");
   await collectDemos();
 
   console.log("\n=== ЭТАП 2: ЗАГРУЗКА КАРТЫ ===");
   if (!loadMap()) { console.log("НЕТ КАРТЫ — выход"); process.exit(1); }
 
-  console.log("\n=== ЭТАП 3: ПРЕДОБУЧЕНИЕ (по 120с на демку) ===");
+  console.log("\n=== ЭТАП 3: ПРЕДОБУЧЕНИЕ (по 120с на демку, lr=" + PRETRAIN_LR + ") ===");
   for (let i = 0; i < W.demos.length; i++) {
     await pretrainOnDemo(W.demos[i], i, W.demos.length);
   }
   saveWeights();
   console.log("=== ПРЕДОБУЧЕНИЕ ЗАВЕРШЕНО ===\n");
 
-  // Запускаем авто-проверку топа раз в 5 минут
   setInterval(autoCheck, AUTO_CHECK_MS);
 
-  console.log("=== ЭТАП 4: ИГРА + ОНЛАЙН-ОБУЧЕНИЕ + ОТПРАВКА РЕКОРДОВ ===\n");
+  console.log("=== ЭТАП 4: ИГРА + ОНЛАЙН-ОБУЧЕНИЕ + ОТПРАВКА (lr=" + RL_LR + ") ===\n");
   let globalRun = 0;
   while (true) {
     globalRun++;
@@ -677,24 +712,23 @@ async function runBot() {
       const finished = r.elapsed;
       if (finished < W.best) W.best = finished;
 
-      // Обновляем локальный лучший рекорд
       if (finished < BEST_TIME) {
         BEST_TIME = finished;
         fs.writeFileSync(RECORD_FILE, BEST_TIME.toFixed(3));
-        console.log("[" + MAP_ID + "] FINISH " + finished.toFixed(2) + "s  ★ НОВЫЙ ЛОКАЛЬНЫЙ РЕКОРД ★");
+        console.log("[" + MAP_ID + "] FINISH " + finished.toFixed(2) + "s  ★ ЛОКАЛЬНЫЙ РЕКОРД ★");
       } else {
         console.log("[" + MAP_ID + "] FINISH " + finished.toFixed(2) + "s (best " + W.best.toFixed(2) + ")");
       }
 
-      const reward = 20.0 - finished;
+      const reward = 25.0 - finished;   // цель 16с → reward +9
       if (r.steps.length) rlUpdate(r.steps, reward, RL_LR);
       saveWeights();
     } else if (r.fell) {
       console.log("[" + MAP_ID + "] FELL " + r.elapsed.toFixed(2) + "s");
-      if (r.steps.length) rlUpdate(r.steps, -1.5, RL_LR);
+      if (r.steps.length) rlUpdate(r.steps, -2.0, RL_LR);
     } else {
       console.log("[" + MAP_ID + "] TIMEOUT " + r.elapsed.toFixed(2) + "s");
-      if (r.steps.length) rlUpdate(r.steps, -1.0, RL_LR);
+      if (r.steps.length) rlUpdate(r.steps, -1.5, RL_LR);
     }
 
     if (globalRun % 30 === 0) saveWeights();
