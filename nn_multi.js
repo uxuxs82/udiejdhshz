@@ -14,24 +14,38 @@ const FLAG_ID = "flags_30";
 const AVATAR_ID = 8;
 const APP_VER = "2.6.3";
 
-const TARGET_DEMOS = 10;
-const COLLECT_PER_MAP_MS = 3 * 60 * 1000;
-const MAX_STUCK_ROUNDS = 4;
-const RL_LR = 0.0005;
-const SPEED = 1.5;
+const MAP_ID = "mood";
+const MAP_ROOM = "Speedrun-Mood";
+
+const TARGET_DEMOS = 15;
+const MAX_COLLECT_MS = 10 * 60 * 1000;
+const TRAIN_PER_DEMO_MS = 120 * 1000;
+
+const RL_LR = 0.001;
+const PRETRAIN_LR = 0.002;
+const SPEED = 2.5;
 const MAX_TURN = 0.12;
 const SUBSTEPS = 6;
 const JUMP_H = 1.2;
 const JUMP_DUR = 0.5;
-const EPISODE_STEPS = 700;
+const EPISODE_STEPS = 1500;
 const STEP_SLEEP = 6;
+const FINISH_RADIUS = 10;   // ±10 до финиша = финиш
 
-const MAPS = [
-  { id: "mood",     room: "Speedrun-Mood"    },
-  { id: "alter",    room: "Parkour-Alter"    },
-  { id: "blocks",   room: "Parkour-Blocks"   },
-  { id: "infinity", room: "Parkour-Infinity" },
-];
+// ====== ТОП / РЕКОРДЫ ======
+const STATE_FILE = "top_state.json";
+const AUTO_CHECK_MS = 5 * 60 * 1000;
+const RECORD_FILE = "best_record.txt";
+
+let STATE = { bestSent: 999, lastSent: 0, lastCheck: 0 };
+try { STATE = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8")); } catch (e) {}
+function saveState() { try { fs.writeFileSync(STATE_FILE, JSON.stringify(STATE)); } catch (e) {} }
+
+let BEST_TIME = 999;   // лучший результат за всё время (локально)
+try {
+  const n = parseFloat(fs.readFileSync(RECORD_FILE, "utf-8").trim());
+  if (!isNaN(n)) BEST_TIME = n;
+} catch (e) {}
 
 const SEEN_FILE = "seen_nicks.json";
 
@@ -106,33 +120,138 @@ async function fetchScores(room) {
   return topScores;
 }
 
-async function collectDemosForMap(map) {
-  const dir = "demos/" + map.id;
+async function sendRecord(time) {
+  const guid = mkGuid(), guidsub = guid.substring(0, 10);
+  const deviceid = "rec_" + Date.now();
+  const ws = await connectWS("ws://" + ADDR + "/socket.io/?EIO=4&transport=websocket");
+  const tStr = String(Math.floor(time/60)).padStart(2,"0") + ":" + (time%60).toFixed(3).padStart(6,"0");
+
+  emit(ws, "register", { _id:"", deviceid, nick:NICK, coin:8400228, os:"Linux", installerName:"com.android.vending", sid:deviceid, version:APP_VER, dt:new Date().toISOString() });
+  await sleep(200);
+  emit(ws, "savedata", { _id:"", deviceid, nick:NICK, coin:8400228, os:"Linux", installerName:"com.android.vending", sid:deviceid, version:APP_VER, rank_id:RANK_ID, SelectedFlag:FLAG_ID, SelectedAvatar:AVATAR_ID, guid, userpin:0, refcode:"MVSFN7SE", FirstCase:"True", dt:new Date().toISOString() });
+  await sleep(200);
+  emit(ws, "playerinfo", { nick:NICK, rank_str:RANK_STR, cape_str:"cape-0", rank_id:RANK_ID, flag_id:FLAG_ID, avatar_id:AVATAR_ID, pr:"-", id:guidsub });
+  await sleep(100);
+  emit(ws, "move", { x:0, y:0, z:0, lx:0, ly:0, lz:0, ry:0, rw:0.999, pr:"-", id:guidsub });
+  await sleep(100);
+  emit(ws, "joinroom", { room: MAP_ROOM, v:APP_VER, c:3, m:"v", guid, guidsub });
+  await sleep(300);
+  emit(ws, "connectToRoom", MAP_ROOM);
+  await sleep(400);
+
+  const payload = {
+    nick: NICK + " [" + tStr + "]",
+    score: 999,
+    time: time,
+    str_time: tStr,
+    str_nick: NICK,
+    flag: FLAG_ID,
+    guid: guid,
+    rank: RANK_STR,
+    sid: deviceid,
+    m: "v",
+    installerName: "com.android.vending"
+  };
+  emit(ws, "levelcomplete", payload);
+  await sleep(200);
+  emit(ws, "newscore", payload);
+  console.log(">>> NEWSCORE SENT: " + time.toFixed(3) + "c");
+  await sleep(2000);
+  try { ws.close(); } catch (e) {}
+}
+
+// Возвращает:
+//   { status: "in_top", topTime: X }  — наш ник в топе
+//   { status: "empty", topTime: null } — топа нет / не наш
+//   { status: "err", msg }             — ошибка запроса
+async function checkTop() {
+  let top = [];
+  try { top = await fetchScores(MAP_ROOM); }
+  catch (e) { return { status: "err", msg: e.message }; }
+
+  let ourBest = Infinity, ourEntry = null;
+  for (const s of top) {
+    if (s && s.nick && s.nick.includes(NICK)) {
+      const tt = parseFloat(s.time);
+      if (!isNaN(tt) && tt < ourBest) { ourBest = tt; ourEntry = s; }
+    }
+  }
+  if (ourEntry) return { status: "in_top", topTime: ourBest };
+  return { status: "empty", topTime: null };
+}
+
+let autoCheckRunning = false;
+async function autoCheck() {
+  if (autoCheckRunning) return;
+  autoCheckRunning = true;
+  try {
+    const now = Date.now();
+    if (BEST_TIME >= 999) {
+      console.log("[AUTO] пока нет локального финиша — нечего отправлять");
+      autoCheckRunning = false;
+      return;
+    }
+
+    console.log("[AUTO] проверка топа | локальный лучший: " + BEST_TIME.toFixed(3) + "c | отправленный: " + (STATE.bestSent === 999 ? "—" : STATE.bestSent.toFixed(3) + "c"));
+
+    const res = await checkTop();
+    if (res.status === "err") {
+      console.log("[AUTO] ошибка топа: " + res.msg);
+      autoCheckRunning = false;
+      return;
+    }
+
+    if (res.status === "in_top") {
+      console.log("[AUTO] наш ник в топе (" + res.topTime.toFixed(3) + "c) — не засоряем, ждём пока исчезнет");
+      autoCheckRunning = false;
+      return;
+    }
+
+    // В топе нас нет — можно отправить
+    if (BEST_TIME >= STATE.bestSent) {
+      console.log("[AUTO] новый рекорд (" + BEST_TIME.toFixed(3) + ") не лучше отправленного (" + STATE.bestSent.toFixed(3) + ") — пропуск");
+      autoCheckRunning = false;
+      return;
+    }
+
+    console.log("[AUTO] отправляем новый рекорд: " + BEST_TIME.toFixed(3) + "c (было " + (STATE.bestSent === 999 ? "—" : STATE.bestSent.toFixed(3)) + ")");
+    await sendRecord(BEST_TIME);
+    STATE.bestSent = BEST_TIME;
+    STATE.lastSent = now;
+    saveState();
+    console.log("[AUTO] отправлено. Следующая проверка через 5 минут");
+  } catch (e) {
+    console.log("[AUTO] err: " + e.message);
+  }
+  autoCheckRunning = false;
+}
+
+// ====== СБОР ДЕМОК ======
+async function collectDemos() {
+  const dir = "demos/" + MAP_ID;
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const count = () => { try { return fs.readdirSync(dir).filter(f => f.endsWith(".gz")).length; } catch (e) { return 0; } };
 
   let have = count();
-  console.log("\n[" + map.id + "] старт: " + have + " демок | лимит 3 минуты | цель " + TARGET_DEMOS);
+  console.log("[" + MAP_ID + "] старт: " + have + " демок | цель " + TARGET_DEMOS);
   const tStart = Date.now();
   let round = 0;
-  let stuckRounds = 0;
 
-  while (have < TARGET_DEMOS && Date.now() - tStart < COLLECT_PER_MAP_MS && stuckRounds < MAX_STUCK_ROUNDS) {
+  while (have < TARGET_DEMOS && Date.now() - tStart < MAX_COLLECT_MS) {
     round++;
     let scores = [];
-    try { scores = await fetchScores(map.room); }
-    catch (e) { console.log("[" + map.id + "] fetch err: " + e.message); await sleep(2000); continue; }
+    try { scores = await fetchScores(MAP_ROOM); }
+    catch (e) { console.log("[" + MAP_ID + "] fetch err: " + e.message); await sleep(2000); continue; }
 
-    const left = Math.round((COLLECT_PER_MAP_MS - (Date.now() - tStart)) / 1000);
-    console.log("[" + map.id + "] round " + round + " — " + scores.length + " записей | есть " + have + "/" + TARGET_DEMOS + " | осталось " + left + "с");
+    const left = Math.round((MAX_COLLECT_MS - (Date.now() - tStart)) / 1000);
+    console.log("[" + MAP_ID + "] round " + round + " — " + scores.length + " записей | есть " + have + "/" + TARGET_DEMOS + " | осталось " + left + "с");
 
     let got = 0;
     for (let i = 0; i < scores.length && have < TARGET_DEMOS; i++) {
-      if (Date.now() - tStart > COLLECT_PER_MAP_MS) break;
-
+      if (Date.now() - tStart > MAX_COLLECT_MS) break;
       const s = scores[i];
       if (!s.demoFile || !s.nick) continue;
-      const k = map.id + ":" + s.nick;
+      const k = MAP_ID + ":" + s.nick;
       if (SEEN[k] === "ok") continue;
       const fails = SEEN[k + ":fails"] || 0;
       if (fails >= 2) { SEEN[k] = "dead"; saveSeen(); continue; }
@@ -143,9 +262,7 @@ async function collectDemosForMap(map) {
         const safe = s.nick.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40);
         try {
           fs.writeFileSync(dir + "/" + safe + ".gz", buf);
-          SEEN[k] = "ok";
-          SEEN[k + ":fails"] = 0;
-          saveSeen();
+          SEEN[k] = "ok"; SEEN[k + ":fails"] = 0; saveSeen();
           have++; got++;
           console.log("OK " + buf.length + "b → " + have + "/" + TARGET_DEMOS);
         } catch (e) { console.log("write err"); }
@@ -156,51 +273,48 @@ async function collectDemosForMap(map) {
       }
       await sleep(300);
     }
-
     if (have >= TARGET_DEMOS) break;
-    if (got === 0) { stuckRounds++; await sleep(2000); } else stuckRounds = 0;
+    if (got === 0) await sleep(3000);
   }
-
-  console.log("[" + map.id + "] СОБРАНО: " + have + "/" + TARGET_DEMOS);
+  console.log("[" + MAP_ID + "] ИТОГ СБОРА: " + have + "/" + TARGET_DEMOS);
   return have;
 }
 
-const IN = 10, H1 = 48, H2 = 24, OUT = 2;
+// ====== СЕТЬ ======
+const IN = 10, H1 = 64, H2 = 32, OUT = 2;
 function rnd(){ return (Math.random()-0.5)*0.3; }
 function zeros(a){ return Array.isArray(a[0]) ? a.map(r => r.map(()=>0)) : a.map(()=>0); }
 function relu(x){ return x>0?x:0; }
 
-function makeWorker(mapId, room) {
-  const w = {
-    id: mapId, room,
-    W1: Array.from({length:H1},()=>Array.from({length:IN},rnd)),
-    B1: Array.from({length:H1},()=>0),
-    W2: Array.from({length:H2},()=>Array.from({length:H1},rnd)),
-    B2: Array.from({length:H2},()=>0),
-    W3: Array.from({length:OUT},()=>Array.from({length:H2},rnd)),
-    B3: Array.from({length:OUT},()=>0),
-    adamT: 0,
-    demos: [], safe: new Set(), ymap: {},
-    spawn: null, finish: null,
-    runs: 0, wins: 0, best: 999,
-    wf: "weights_" + mapId + ".json",
-  };
-  try {
-    const ww = JSON.parse(fs.readFileSync(w.wf, "utf-8"));
-    w.W1=ww.W1; w.B1=ww.B1; w.W2=ww.W2; w.B2=ww.B2; w.W3=ww.W3; w.B3=ww.B3;
-    console.log("[" + mapId + "] weights loaded");
-  } catch (e) { console.log("[" + mapId + "] fresh weights"); }
-  w.M = { W1:zeros(w.W1), B1:zeros(w.B1), W2:zeros(w.W2), B2:zeros(w.B2), W3:zeros(w.W3), B3:zeros(w.B3) };
-  w.V = { W1:zeros(w.W1), B1:zeros(w.B1), W2:zeros(w.W2), B2:zeros(w.B2), W3:zeros(w.W3), B3:zeros(w.B3) };
-  return w;
-}
+const W = {
+  W1: Array.from({length:H1},()=>Array.from({length:IN},rnd)),
+  B1: Array.from({length:H1},()=>0),
+  W2: Array.from({length:H2},()=>Array.from({length:H1},rnd)),
+  B2: Array.from({length:H2},()=>0),
+  W3: Array.from({length:OUT},()=>Array.from({length:H2},rnd)),
+  B3: Array.from({length:OUT},()=>0),
+  adamT: 0,
+  demos: [], safe: new Set(), ymap: {},
+  spawn: null, finish: null,
+  runs: 0, wins: 0, best: 999,
+  wf: "weights_" + MAP_ID + ".json",
+};
 
-function loadMap(w) {
-  const dir = "demos/" + w.id;
-  w.demos = []; w.safe = new Set(); w.ymap = {};
-  if (!fs.existsSync(dir)) { console.log("[" + w.id + "] нет папки"); return false; }
+try {
+  const ww = JSON.parse(fs.readFileSync(W.wf, "utf-8"));
+  W.W1=ww.W1; W.B1=ww.B1; W.W2=ww.W2; W.B2=ww.B2; W.W3=ww.W3; W.B3=ww.B3;
+  console.log("[" + MAP_ID + "] weights loaded");
+} catch (e) { console.log("[" + MAP_ID + "] fresh weights"); }
+
+const M = { W1:zeros(W.W1), B1:zeros(W.B1), W2:zeros(W.W2), B2:zeros(W.B2), W3:zeros(W.W3), B3:zeros(W.B3) };
+const V = { W1:zeros(W.W1), B1:zeros(W.B1), W2:zeros(W.W2), B2:zeros(W.B2), W3:zeros(W.W3), B3:zeros(W.B3) };
+
+function loadMap() {
+  const dir = "demos/" + MAP_ID;
+  W.demos = []; W.safe = new Set(); W.ymap = {};
+  if (!fs.existsSync(dir)) return false;
   const files = fs.readdirSync(dir).filter(f => f.endsWith(".gz"));
-  if (!files.length) { console.log("[" + w.id + "] нет демок"); return false; }
+  if (!files.length) return false;
 
   for (const f of files) {
     try {
@@ -211,58 +325,50 @@ function loadMap(w) {
       const d = JSON.parse(raw);
       if (!d.frames || d.frames.length < 5) continue;
       const p = d.frames.map(fr => ({ x: fr.x/1e5, y: fr.y/1e5, z: fr.z/1e5, t: fr.t }));
-      w.demos.push({ path: p, time: p[p.length-1].t, nick: d.nick || f });
+      W.demos.push({ path: p, time: p[p.length-1].t, nick: d.nick || f });
     } catch (e) {}
   }
-  if (!w.demos.length) { console.log("[" + w.id + "] демки не распарсились"); return false; }
+  if (!W.demos.length) return false;
 
-  const longest = w.demos.reduce((a,b) => a.path.length > b.path.length ? a : b);
-  w.spawn = longest.path[0];
+  const longest = W.demos.reduce((a,b) => a.path.length > b.path.length ? a : b);
+  W.spawn = longest.path[0];
+  const fastest = W.demos.reduce((a,b) => a.time < b.time ? a : b);
+  W.finish = fastest.path[fastest.path.length - 1];
 
-  let bestDist = 0;
-  let bestFinish = longest.path[longest.path.length - 1];
-  for (const d of w.demos) {
-    for (const p of d.path) {
-      const dist = Math.hypot(p.x - w.spawn.x, p.z - w.spawn.z);
-      if (dist > bestDist) { bestDist = dist; bestFinish = p; }
-    }
-  }
-  w.finish = bestFinish;
-
-  for (const d of w.demos) for (const fr of d.path) {
+  for (const d of W.demos) for (const fr of d.path) {
     const k = Math.round(fr.x) + "," + Math.round(fr.z);
-    w.safe.add(k);
-    if (w.ymap[k] === undefined) w.ymap[k] = fr.y;
+    W.safe.add(k);
+    if (W.ymap[k] === undefined) W.ymap[k] = fr.y;
   }
-  console.log("[" + w.id + "] " + w.demos.length + " демок | spawn(" + w.spawn.x.toFixed(1) + "," + w.spawn.z.toFixed(1) + ") | finish(" + w.finish.x.toFixed(1) + "," + w.finish.z.toFixed(1) + ") | dist " + bestDist.toFixed(1) + "м");
+  console.log("[" + MAP_ID + "] " + W.demos.length + " демок | spawn(" + W.spawn.x.toFixed(1) + "," + W.spawn.z.toFixed(1) + ") | finish(" + W.finish.x.toFixed(1) + "," + W.finish.z.toFixed(1) + ")");
   return true;
 }
 
-function isSafe(w, x, z) { return w.safe.has(Math.round(x) + "," + Math.round(z)); }
-function getY(w, x, z) {
+function isSafe(x, z) { return W.safe.has(Math.round(x) + "," + Math.round(z)); }
+function getY(x, z) {
   const cx = Math.round(x), cz = Math.round(z);
   const k = cx + "," + cz;
-  if (w.ymap[k] !== undefined) return w.ymap[k];
+  if (W.ymap[k] !== undefined) return W.ymap[k];
   for (let r = 1; r <= 5; r++) for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) {
     const kk = (cx+dx) + "," + (cz+dz);
-    if (w.ymap[kk] !== undefined) return w.ymap[kk];
+    if (W.ymap[kk] !== undefined) return W.ymap[kk];
   }
-  return w.spawn ? w.spawn.y : 0;
+  return W.spawn ? W.spawn.y : 0;
 }
 
-function bfsNext(w, sx, sz, gx, gz) {
+function bfsNext(sx, sz, gx, gz) {
   const key = (x,z) => x + "," + z;
   const sxC = Math.round(sx), szC = Math.round(sz);
   const gxC = Math.round(gx), gzC = Math.round(gz);
   const q = [[sxC,szC]], prev = new Map(); prev.set(key(sxC,szC), null);
   const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
   let found = false, n = 0;
-  while (q.length && n++ < 3000) {
+  while (q.length && n++ < 5000) {
     const [x,z] = q.shift();
     if (x === gxC && z === gzC) { found = true; break; }
     for (const [dx,dz] of dirs) {
       const nx = x+dx, nz = z+dz, k = key(nx,nz);
-      if (!w.safe.has(k) || prev.has(k)) continue;
+      if (!W.safe.has(k) || prev.has(k)) continue;
       prev.set(k, key(x,z)); q.push([nx,nz]);
     }
   }
@@ -275,21 +381,27 @@ function bfsNext(w, sx, sz, gx, gz) {
   return { x: wx, z: wz };
 }
 
-function fwd(w, inp) {
+function fwd(inp) {
   const h1 = new Array(H1);
-  for (let i=0;i<H1;i++){ let s=w.B1[i]; for (let j=0;j<IN;j++) s += w.W1[i][j]*inp[j]; h1[i]=relu(s); }
+  for (let i=0;i<H1;i++){ let s=W.B1[i]; for (let j=0;j<IN;j++) s += W.W1[i][j]*inp[j]; h1[i]=relu(s); }
   const h2 = new Array(H2);
-  for (let i=0;i<H2;i++){ let s=w.B2[i]; for (let j=0;j<H1;j++) s += w.W2[i][j]*h1[j]; h2[i]=relu(s); }
+  for (let i=0;i<H2;i++){ let s=W.B2[i]; for (let j=0;j<H1;j++) s += W.W2[i][j]*h1[j]; h2[i]=relu(s); }
   const o = new Array(OUT);
-  for (let i=0;i<OUT;i++){ let s=w.B3[i]; for (let j=0;j<H2;j++) s += w.W3[i][j]*h2[j]; o[i]=Math.tanh(s); }
+  for (let i=0;i<OUT;i++){ let s=W.B3[i]; for (let j=0;j<H2;j++) s += W.W3[i][j]*h2[j]; o[i]=Math.tanh(s); }
   return { o, h1, h2 };
 }
 
-function mkIn(w, x, z, px, pz) {
-  const dx = w.finish.x - x, dz = w.finish.z - z;
+function mkIn(x, z, px, pz) {
+  const dx = W.finish.x - x, dz = W.finish.z - z;
   const dist = Math.hypot(dx, dz) || 1;
   const vx = x - px, vz = z - pz;
   return [ dx/100, dz/100, dx/dist, dz/dist, dist/100, vx/SPEED, vz/SPEED, Math.sin(x/50), Math.sin(z/50), dist < 20 ? 1 : 0 ];
+}
+
+function mkTgt(cx, cz, nx, nz) {
+  let dx = nx - cx, dz = nz - cz;
+  const l = Math.hypot(dx, dz) || 1;
+  return [dx/l, dz/l];
 }
 
 const B1A = 0.9, B2A = 0.999, EPS = 1e-8;
@@ -314,8 +426,8 @@ function adam(p, g, m, v, lr, scale, T) {
   }
 }
 
-function backprop(w, inp, tgt, lr, scale) {
-  const { o, h1, h2 } = fwd(w, inp);
+function backprop(inp, tgt, lr, scale) {
+  const { o, h1, h2 } = fwd(inp);
   const dO = [ 2*(o[0]-tgt[0]), 2*(o[1]-tgt[1]) ];
   for (let i=0;i<OUT;i++) if (Math.abs(dO[i])>1) dO[i]=Math.sign(dO[i]);
 
@@ -325,7 +437,7 @@ function backprop(w, inp, tgt, lr, scale) {
 
   const dH2 = new Array(H2).fill(0);
   for (let j=0;j<H2;j++) {
-    for (let i=0;i<OUT;i++) dH2[j] += dO[i]*w.W3[i][j];
+    for (let i=0;i<OUT;i++) dH2[j] += dO[i]*W.W3[i][j];
     if (h2[j] <= 0) dH2[j] = 0;
     if (Math.abs(dH2[j]) > 1) dH2[j] = Math.sign(dH2[j]);
   }
@@ -335,7 +447,7 @@ function backprop(w, inp, tgt, lr, scale) {
 
   const dH1 = new Array(H1).fill(0);
   for (let j=0;j<H1;j++) {
-    for (let i=0;i<H2;i++) dH1[j] += dH2[i]*w.W2[i][j];
+    for (let i=0;i<H2;i++) dH1[j] += dH2[i]*W.W2[i][j];
     if (h1[j] <= 0) dH1[j] = 0;
     if (Math.abs(dH1[j]) > 1) dH1[j] = Math.sign(dH1[j]);
   }
@@ -343,38 +455,69 @@ function backprop(w, inp, tgt, lr, scale) {
   const gB1 = dH1.slice();
   for (let i=0;i<H1;i++) for (let j=0;j<IN;j++) gW1[i][j] = dH1[i]*inp[j];
 
-  w.adamT++;
-  adam(w.W1, gW1, w.M.W1, w.V.W1, lr, scale, w.adamT);
-  adam(w.B1, gB1, w.M.B1, w.V.B1, lr, scale, w.adamT);
-  adam(w.W2, gW2, w.M.W2, w.V.W2, lr, scale, w.adamT);
-  adam(w.B2, gB2, w.M.B2, w.V.B2, lr, scale, w.adamT);
-  adam(w.W3, gW3, w.M.W3, w.V.W3, lr, scale, w.adamT);
-  adam(w.B3, gB3, w.M.B3, w.V.B3, lr, scale, w.adamT);
+  W.adamT++;
+  adam(W.W1, gW1, M.W1, V.W1, lr, scale, W.adamT);
+  adam(W.B1, gB1, M.B1, V.B1, lr, scale, W.adamT);
+  adam(W.W2, gW2, M.W2, V.W2, lr, scale, W.adamT);
+  adam(W.B2, gB2, M.B2, V.B2, lr, scale, W.adamT);
+  adam(W.W3, gW3, M.W3, V.W3, lr, scale, W.adamT);
+  adam(W.B3, gB3, M.B3, V.B3, lr, scale, W.adamT);
   return dO[0]*dO[0] + dO[1]*dO[1];
 }
 
-function saveWeights(w) {
-  try { fs.writeFileSync(w.wf, JSON.stringify({ W1:w.W1, B1:w.B1, W2:w.W2, B2:w.B2, W3:w.W3, B3:w.B3 })); } catch (e) {}
+function saveWeights() {
+  try { fs.writeFileSync(W.wf, JSON.stringify({ W1:W.W1, B1:W.B1, W2:W.W2, B2:W.B2, W3:W.W3, B3:W.B3 })); } catch (e) {}
 }
 
-function rlUpdate(w, steps, reward, lr) {
+function rlUpdate(steps, reward, lr) {
   if (!steps.length) return;
-  const scale = Math.sign(reward) * Math.min(Math.abs(reward), 0.3);
+  const scale = Math.sign(reward) * Math.min(Math.abs(reward), 0.5);
   for (let i=0; i<steps.length; i++) {
     const decay = Math.pow(0.995, steps.length - i);
-    backprop(w, steps[i].inp, steps[i].action, lr, scale * decay);
+    backprop(steps[i].inp, steps[i].action, lr, scale * decay);
   }
 }
 
-async function runBot(w) {
+async function pretrainOnDemo(demo, idx, total) {
+  const tStart = Date.now();
+  const samples = [];
+  for (let i = 1; i < demo.path.length - 1; i++) {
+    samples.push({
+      inp: mkIn(demo.path[i].x, demo.path[i].z, demo.path[i-1].x, demo.path[i-1].z),
+      tgt: mkTgt(demo.path[i].x, demo.path[i].z, demo.path[i+1].x, demo.path[i+1].z)
+    });
+  }
+  if (!samples.length) return;
+
+  let epochs = 0;
+  let lastLog = 0;
+  while (Date.now() - tStart < TRAIN_PER_DEMO_MS) {
+    epochs++;
+    let L = 0;
+    for (let i = samples.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [samples[i], samples[j]] = [samples[j], samples[i]];
+    }
+    for (const s of samples) L += backprop(s.inp, s.tgt, PRETRAIN_LR, 1);
+
+    const elapsed = Date.now() - tStart;
+    if (elapsed - lastLog > 10000) {
+      lastLog = elapsed;
+      console.log("  [" + (idx+1) + "/" + total + "] " + Math.round(elapsed/1000) + "с | эпох " + epochs + " | loss " + (L/samples.length).toFixed(5));
+    }
+  }
+  console.log("  [" + (idx+1) + "/" + total + "] готово, эпох " + epochs);
+}
+
+async function runBot() {
   const guid = mkGuid(), guidsub = guid.substring(0, 10);
   const deviceid = "a_" + Date.now() + "_" + Math.random().toString(36).slice(2,6);
-  let pos = { x: w.spawn.x, y: w.spawn.y, z: w.spawn.z };
-  let prev = { x: w.spawn.x, z: w.spawn.z };
+  let pos = { x: W.spawn.x, y: W.spawn.y, z: W.spawn.z };
+  let prev = { x: W.spawn.x, z: W.spawn.z };
   let rotY = 0;
-  let waypoint = { x: w.finish.x, z: w.finish.z };
+  let waypoint = { x: W.finish.x, z: W.finish.z };
   let stuckCounter = 0;
-  let lastDist = Math.hypot(w.spawn.x - w.finish.x, w.spawn.z - w.finish.z);
+  let lastDist = Math.hypot(W.spawn.x - W.finish.x, W.spawn.z - W.finish.z);
   let jumping = false, jumpTime = 0;
   const t0 = Date.now();
   const episodeSteps = [];
@@ -389,18 +532,18 @@ async function runBot(w) {
     await sleep(20);
     emit(ws, "move", { x:pos.x, y:pos.y, z:pos.z, lx:pos.x, ly:pos.y, lz:pos.z, ry:0, rw:1, pr:"-", id:guidsub });
     await sleep(30);
-    emit(ws, "joinroom", { room: w.room, v:APP_VER, c:3, m:"v", guid, guidsub });
+    emit(ws, "joinroom", { room: MAP_ROOM, v:APP_VER, c:3, m:"v", guid, guidsub });
     await sleep(50);
-    emit(ws, "connectToRoom", w.room);
+    emit(ws, "connectToRoom", MAP_ROOM);
     await sleep(100);
 
     let step = 0, done = false, fell = false;
     while (step < EPISODE_STEPS && ws.readyState === 1) {
-      const inp = mkIn(w, pos.x, pos.z, prev.x, prev.z);
-      const { o } = fwd(w, inp);
+      const inp = mkIn(pos.x, pos.z, prev.x, prev.z);
+      const { o } = fwd(inp);
 
       if (step % 6 === 0 || stuckCounter > 4) {
-        const wp = bfsNext(w, pos.x, pos.z, w.finish.x, w.finish.z);
+        const wp = bfsNext(pos.x, pos.z, W.finish.x, W.finish.z);
         if (wp) waypoint = wp;
         stuckCounter = 0;
       }
@@ -409,7 +552,7 @@ async function runBot(w) {
       const nnMag = Math.hypot(nnX, nnZ);
       if (nnMag > 1e-6) { nnX /= nnMag; nnZ /= nnMag; }
 
-      const eps = Math.max(0.03, 0.4 * Math.exp(-w.runs / 100));
+      const eps = Math.max(0.02, 0.3 * Math.exp(-W.runs / 100));
       nnX += (Math.random()*2-1) * eps;
       nnZ += (Math.random()*2-1) * eps;
 
@@ -424,7 +567,7 @@ async function runBot(w) {
       let dx = dirX * SPEED, dz = dirZ * SPEED;
       let nx = pos.x + dx, nz = pos.z + dz;
 
-      if (!isSafe(w, nx, nz)) {
+      if (!isSafe(nx, nz)) {
         let found = false;
         for (let k = 1; k <= 12; k++) {
           const angles = [k*Math.PI/12, -k*Math.PI/12];
@@ -433,7 +576,7 @@ async function runBot(w) {
             const newAng = baseAng + a;
             const tx = pos.x + Math.cos(newAng)*SPEED;
             const tz = pos.z + Math.sin(newAng)*SPEED;
-            if (isSafe(w, tx, tz)) { nx = tx; nz = tz; dx = tx - pos.x; dz = tz - pos.z; found = true; break; }
+            if (isSafe(tx, tz)) { nx = tx; nz = tz; dx = tx - pos.x; dz = tz - pos.z; found = true; break; }
           }
           if (found) break;
         }
@@ -451,7 +594,7 @@ async function runBot(w) {
 
       prev = { x: pos.x, z: pos.z };
       pos.x = nx; pos.z = nz;
-      pos.y = getY(w, pos.x, pos.z);
+      pos.y = getY(pos.x, pos.z);
 
       const targetYaw = Math.atan2(dx, dz);
       let dyaw = targetYaw - rotY;
@@ -485,12 +628,12 @@ async function runBot(w) {
         await sleep(STEP_SLEEP);
       }
 
-      const dNow = Math.hypot(pos.x - w.finish.x, pos.z - w.finish.z);
+      const dNow = Math.hypot(pos.x - W.finish.x, pos.z - W.finish.z);
       if (dNow > lastDist - 0.05) stuckCounter++; else stuckCounter = 0;
       lastDist = dNow;
 
-      const dist3 = Math.hypot(pos.x - w.finish.x, pos.y - w.finish.y, pos.z - w.finish.z);
-      if (dist3 < 3) { done = true; break; }
+      const dist3 = Math.hypot(pos.x - W.finish.x, pos.y - W.finish.y, pos.z - W.finish.z);
+      if (dist3 < FINISH_RADIUS) { done = true; break; }   // ±10 до финиша
       step++;
     }
     try { ws.close(); } catch (e) {}
@@ -501,49 +644,60 @@ async function runBot(w) {
   }
 }
 
-async function loopWorker(w) {
-  console.log("[" + w.id + "] воркер запущен");
+(async () => {
+  console.log("=== uxuxx ai SOLO — " + MAP_ID + " — с отправкой рекордов ===");
+  console.log("Локальный лучший: " + (BEST_TIME === 999 ? "—" : BEST_TIME.toFixed(3) + "c"));
+  console.log("Уже отправленный: " + (STATE.bestSent === 999 ? "—" : STATE.bestSent.toFixed(3) + "c") + "\n");
+
+  console.log("=== ЭТАП 1: СБОР ДЕМОК ===");
+  await collectDemos();
+
+  console.log("\n=== ЭТАП 2: ЗАГРУЗКА КАРТЫ ===");
+  if (!loadMap()) { console.log("НЕТ КАРТЫ — выход"); process.exit(1); }
+
+  console.log("\n=== ЭТАП 3: ПРЕДОБУЧЕНИЕ (по 120с на демку) ===");
+  for (let i = 0; i < W.demos.length; i++) {
+    await pretrainOnDemo(W.demos[i], i, W.demos.length);
+  }
+  saveWeights();
+  console.log("=== ПРЕДОБУЧЕНИЕ ЗАВЕРШЕНО ===\n");
+
+  // Запускаем авто-проверку топа раз в 5 минут
+  setInterval(autoCheck, AUTO_CHECK_MS);
+
+  console.log("=== ЭТАП 4: ИГРА + ОНЛАЙН-ОБУЧЕНИЕ + ОТПРАВКА РЕКОРДОВ ===\n");
   let globalRun = 0;
   while (true) {
     globalRun++;
-    const r = await runBot(w);
-    w.runs++;
+    const r = await runBot();
+    W.runs++;
+
     if (r.done) {
-      w.wins++;
-      if (r.elapsed < w.best) w.best = r.elapsed;
-      const reward = 6.0 - r.elapsed;
-      console.log("[" + w.id + "] FINISH " + r.elapsed.toFixed(2) + "s reward=" + reward.toFixed(2) + " best=" + w.best.toFixed(2) + " (" + w.wins + "/" + w.runs + ")");
-      if (r.steps.length) rlUpdate(w, r.steps, reward, RL_LR);
-      saveWeights(w);
+      W.wins++;
+      const finished = r.elapsed;
+      if (finished < W.best) W.best = finished;
+
+      // Обновляем локальный лучший рекорд
+      if (finished < BEST_TIME) {
+        BEST_TIME = finished;
+        fs.writeFileSync(RECORD_FILE, BEST_TIME.toFixed(3));
+        console.log("[" + MAP_ID + "] FINISH " + finished.toFixed(2) + "s  ★ НОВЫЙ ЛОКАЛЬНЫЙ РЕКОРД ★");
+      } else {
+        console.log("[" + MAP_ID + "] FINISH " + finished.toFixed(2) + "s (best " + W.best.toFixed(2) + ")");
+      }
+
+      const reward = 20.0 - finished;
+      if (r.steps.length) rlUpdate(r.steps, reward, RL_LR);
+      saveWeights();
     } else if (r.fell) {
-      console.log("[" + w.id + "] FELL " + r.elapsed.toFixed(2) + "s");
-      if (r.steps.length) rlUpdate(w, r.steps, -1.5, RL_LR);
+      console.log("[" + MAP_ID + "] FELL " + r.elapsed.toFixed(2) + "s");
+      if (r.steps.length) rlUpdate(r.steps, -1.5, RL_LR);
     } else {
-      console.log("[" + w.id + "] TIMEOUT " + r.elapsed.toFixed(2) + "s");
-      if (r.steps.length) rlUpdate(w, r.steps, -1.0, RL_LR);
+      console.log("[" + MAP_ID + "] TIMEOUT " + r.elapsed.toFixed(2) + "s");
+      if (r.steps.length) rlUpdate(r.steps, -1.0, RL_LR);
     }
-    if (globalRun % 30 === 0) saveWeights(w);
+
+    if (globalRun % 30 === 0) saveWeights();
     await sleep(20);
   }
-}
-
-(async () => {
-  console.log("=== uxuxx ai MEGA — 4 карты, 4 воркера, 10 демок на карту ===\n");
-
-  console.log("=== СБОР ДЕМОК (3 мин на каждую карту, цель 10) ===");
-  for (const m of MAPS) {
-    await collectDemosForMap(m);
-  }
-
-  console.log("\n=== ЗАГРУЗКА КАРТ ===");
-  const workers = [];
-  for (const m of MAPS) {
-    const w = makeWorker(m.id, m.room);
-    if (loadMap(w)) workers.push(w);
-  }
-
-  if (!workers.length) { console.log("НЕТ КАРТ — выход"); process.exit(1); }
-
-  console.log("\n=== ИГРА + ОБУЧЕНИЕ (" + workers.length + " воркеров) ===\n");
-  await Promise.all(workers.map(w => loopWorker(w)));
 })();
