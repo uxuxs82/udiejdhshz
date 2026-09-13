@@ -1,97 +1,66 @@
 const WebSocket = require("ws");
-const https = require("https");
 const fs = require("fs");
-const path = require("path");
 const zlib = require("zlib");
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const ADDR = "188.245.236.7:30002";
-const CDN = "infocdn.bhoppro.com";
-const NICK = process.env.NICK || "uxuxx ai";
+const ROOM = "Parkour-Infinity";
+const NICK = "uxuxx ai";
+const WF = "nn_rl_weights.json";
+const WB = "nn_rl_weights_backup.json";
+const SPEED = 1.5;
+const MAX_FAILS = 3;
+const RL_LR = 0.0001;
+
 const RANK_ID = 16;
 const RANK_STR = "Master Bhoper Elite";
 const FLAG_ID = "flags_30";
 const AVATAR_ID = 8;
-const APP_VER = "2.6.3";
 
-const MAP_ID = "mood";
-const MAP_ROOM = "Speedrun-Mood";
-
-const TARGET_DEMOS = 15;
-const MAX_COLLECT_MS = 10 * 60 * 1000;
-const TRAIN_PER_DEMO_MS = 120 * 1000;
-
-// ===== БЫСТРОЕ ОБУЧЕНИЕ =====
-const RL_LR = 0.003;         // было 0.001 — в 3 раза быстрее
-const PRETRAIN_LR = 0.005;   // было 0.002 — в 2.5 раза быстрее
-const SPEED = 2.5;
-const MAX_TURN = 0.12;
-const SUBSTEPS = 6;
-const JUMP_H = 1.2;
-const JUMP_DUR = 0.5;
-const EPISODE_STEPS = 1500;
-const STEP_SLEEP = 6;
-const FINISH_RADIUS = 3;
-
-const STATE_FILE = "top_state.json";
+const TOP_FILE = "./top.txt";
+const RECORD_FILE = "./record.txt";
+const STATE_FILE = "./record_state.json";
+const COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const AUTO_CHECK_MS = 5 * 60 * 1000;
-const RECORD_FILE = "best_record.txt";
 
-let STATE = { bestSent: 999, lastSent: 0 };
+let STATE = { lastSent: 0, bestSent: 0 };
 try { STATE = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8")); } catch (e) {}
 function saveState() { try { fs.writeFileSync(STATE_FILE, JSON.stringify(STATE)); } catch (e) {} }
 
-let BEST_TIME = 999;
-try {
-  const n = parseFloat(fs.readFileSync(RECORD_FILE, "utf-8").trim());
-  if (!isNaN(n)) BEST_TIME = n;
-} catch (e) {}
+let BEST_RECORD = 999;
+try { const n = parseFloat(fs.readFileSync(RECORD_FILE, "utf-8").trim()); if (!isNaN(n)) BEST_RECORD = n; } catch (e) {}
 
-const SEEN_FILE = "seen_nicks.json";
+function saveTop(time, steps) {
+  try { fs.writeFileSync(RECORD_FILE, time.toFixed(3)); } catch (e) {}
+  let content = time.toFixed(3) + "c\n";
+  for (let i = 0; i < steps.length; i++) {
+    const s = steps[i];
+    content += "[" + (i+1) + "] t=" + (i*0.08).toFixed(2) + "s x=" + (s.posX||0).toFixed(2) + " y=" + (s.posY||0).toFixed(2) + " z=" + (s.posZ||0).toFixed(2) + "\n";
+  }
+  try { fs.writeFileSync(TOP_FILE, content); } catch (e) {}
+}
 
 function mkGuid(){const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";let g="";for(let i=0;i<22;i++)g+=c[Math.floor(Math.random()*c.length)];return g+"==";}
-const emit = (ws, e, d) => { if (ws && ws.readyState === 1) ws.send("42" + JSON.stringify([e, d])); };
+const emit=(ws,e,d)=>{if(ws&&ws.readyState===1)ws.send("42"+JSON.stringify([e,d]));};
 
-function connectWS(url) {
-  return new Promise((res, rej) => {
-    const ws = new WebSocket(url, { headers: { "User-Agent": "BestHTTP/2 v2.8.4" } });
-    let done = false;
-    const h = data => {
-      const m = data.toString();
-      if (m === "3probe") { ws.send("5"); return; }
-      if (m === "3") { ws.send("2"); return; }
-      if (m === "2") { ws.send("3"); return; }
-      if (m === "40") { done = true; ws.removeListener("message", h); res(ws); }
+function connectWS(url){
+  return new Promise((res,rej)=>{
+    const ws=new WebSocket(url,{headers:{"User-Agent":"BestHTTP/2 v2.8.4"}});
+    let done=false;
+    const h=d=>{const m=d.toString();
+      if(m==="3probe"){ws.send("5");return;}
+      if(m==="3"){ws.send("2");return;}
+      if(m==="2"){ws.send("3");return;}
+      if(m==="40"){done=true;ws.removeListener("message",h);res(ws);}
     };
-    ws.on("message", h); ws.on("error", rej);
-    setTimeout(() => { if (!done) rej(new Error("timeout")); }, 10000);
+    ws.on("message",h);ws.on("error",rej);
+    setTimeout(()=>{if(!done)rej(new Error("timeout"));},8000);
   });
 }
 
-let SEEN = {};
-try { SEEN = JSON.parse(fs.readFileSync(SEEN_FILE, "utf-8")); } catch (e) {}
-function saveSeen() { try { fs.writeFileSync(SEEN_FILE, JSON.stringify(SEEN, null, 2)); } catch (e) {} }
-
-function download(p) {
-  return new Promise(res => {
-    const url = "https://" + CDN + "/demos/" + p;
-    const req = https.get(url, { headers: { "User-Agent": "BestHTTP/2 v2.8.4" } }, r => {
-      if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) {
-        r.resume(); download(r.headers.location).then(res); return;
-      }
-      if (r.statusCode !== 200) { r.resume(); res({ buf: null, status: r.statusCode }); return; }
-      const chunks = [];
-      r.on("data", c => chunks.push(c));
-      r.on("end", () => res({ buf: Buffer.concat(chunks), status: 200 }));
-    });
-    req.on("error", e => res({ buf: null, status: "err:" + e.code }));
-    req.setTimeout(15000, () => { req.destroy(); res({ buf: null, status: "timeout" }); });
-  });
-}
-
-async function fetchScores(room) {
+async function fetchTop() {
   const guid = mkGuid(), guidsub = guid.substring(0, 10);
-  const deviceid = "get_" + Date.now() + "_" + Math.random().toString(36).slice(2,6);
+  const deviceid = "chk_" + Date.now();
   const ws = await connectWS("ws://" + ADDR + "/socket.io/?EIO=4&transport=websocket");
   let topScores = [];
   ws.on("message", raw => {
@@ -104,19 +73,19 @@ async function fetchScores(room) {
       } catch (e) {}
     }
   });
-  emit(ws, "register", { _id:"", deviceid, nick:"getter", coin:8400228, os:"Linux", installerName:"com.android.vending", sid:deviceid, version:APP_VER, dt:new Date().toISOString() });
+  emit(ws, "register", { _id: "", deviceid, nick: "chk", coin: 8400228, os: "Linux", installerName: "com.android.vending", sid: deviceid, version: "2.6.3", dt: new Date().toISOString() });
   await sleep(200);
-  emit(ws, "savedata", { _id:"", deviceid, nick:"getter", coin:8400228, os:"Linux", installerName:"com.android.vending", sid:deviceid, version:APP_VER, rank_id:RANK_ID, SelectedFlag:FLAG_ID, SelectedAvatar:AVATAR_ID, guid, userpin:0, refcode:"MVSFN7SE", FirstCase:"True", dt:new Date().toISOString() });
+  emit(ws, "savedata", { _id: "", deviceid, nick: "chk", coin: 8400228, os: "Linux", installerName: "com.android.vending", sid: deviceid, version: "2.6.3", rank_id: RANK_ID, SelectedFlag: FLAG_ID, SelectedAvatar: AVATAR_ID, guid, userpin: 0, refcode: "MVSFN7SE", FirstCase: "True", dt: new Date().toISOString() });
   await sleep(200);
-  emit(ws, "playerinfo", { nick:"getter", rank_str:RANK_STR, cape_str:"cape-0", rank_id:RANK_ID, flag_id:FLAG_ID, avatar_id:AVATAR_ID, pr:"-", id:guidsub });
+  emit(ws, "playerinfo", { nick: "chk", rank_str: RANK_STR, cape_str: "cape-0", rank_id: RANK_ID, flag_id: FLAG_ID, avatar_id: AVATAR_ID, pr: "-", id: guidsub });
   await sleep(100);
-  emit(ws, "move", { x:0, y:0, z:0, lx:0, ly:0, lz:0, ry:0, rw:0.999, pr:"-", id:guidsub });
+  emit(ws, "move", { x: 0, y: 0, z: 0, lx: 0, ly: 0, lz: 0, ry: 0, rw: 0.999, pr: "-", id: guidsub });
   await sleep(100);
-  emit(ws, "joinroom", { room, v:APP_VER, c:3, m:"v", guid, guidsub });
+  emit(ws, "joinroom", { room: ROOM, v: "2.6.3", c: 3, m: "v", guid, guidsub });
   await sleep(300);
-  emit(ws, "connectToRoom", room);
-  await sleep(5000);
-  try { ws.close(); } catch (e) {}
+  emit(ws, "connectToRoom", ROOM);
+  await sleep(4000);
+  ws.close();
   return topScores;
 }
 
@@ -126,17 +95,17 @@ async function sendRecord(time) {
   const ws = await connectWS("ws://" + ADDR + "/socket.io/?EIO=4&transport=websocket");
   const tStr = String(Math.floor(time/60)).padStart(2,"0") + ":" + (time%60).toFixed(3).padStart(6,"0");
 
-  emit(ws, "register", { _id:"", deviceid, nick:NICK, coin:8400228, os:"Linux", installerName:"com.android.vending", sid:deviceid, version:APP_VER, dt:new Date().toISOString() });
+  emit(ws, "register", { _id: "", deviceid, nick: NICK, coin: 8400228, os: "Linux", installerName: "com.android.vending", sid: deviceid, version: "2.6.3", dt: new Date().toISOString() });
   await sleep(200);
-  emit(ws, "savedata", { _id:"", deviceid, nick:NICK, coin:8400228, os:"Linux", installerName:"com.android.vending", sid:deviceid, version:APP_VER, rank_id:RANK_ID, SelectedFlag:FLAG_ID, SelectedAvatar:AVATAR_ID, guid, userpin:0, refcode:"MVSFN7SE", FirstCase:"True", dt:new Date().toISOString() });
+  emit(ws, "savedata", { _id: "", deviceid, nick: NICK, coin: 8400228, os: "Linux", installerName: "com.android.vending", sid: deviceid, version: "2.6.3", rank_id: RANK_ID, SelectedFlag: FLAG_ID, SelectedAvatar: AVATAR_ID, guid, userpin: 0, refcode: "MVSFN7SE", FirstCase: "True", dt: new Date().toISOString() });
   await sleep(200);
-  emit(ws, "playerinfo", { nick:NICK, rank_str:RANK_STR, cape_str:"cape-0", rank_id:RANK_ID, flag_id:FLAG_ID, avatar_id:AVATAR_ID, pr:"-", id:guidsub });
+  emit(ws, "playerinfo", { nick: NICK, rank_str: RANK_STR, cape_str: "cape-0", rank_id: RANK_ID, flag_id: FLAG_ID, avatar_id: AVATAR_ID, pr: "-", id: guidsub });
   await sleep(100);
-  emit(ws, "move", { x:0, y:0, z:0, lx:0, ly:0, lz:0, ry:0, rw:0.999, pr:"-", id:guidsub });
+  emit(ws, "move", { x: 929.8, y: 169.3, z: -2704.5, lx: 929.8, ly: 169.3, lz: -2704.5, ry: 0, rw: 0.999, pr: "-", id: guidsub });
   await sleep(100);
-  emit(ws, "joinroom", { room: MAP_ROOM, v:APP_VER, c:3, m:"v", guid, guidsub });
+  emit(ws, "joinroom", { room: ROOM, v: "2.6.3", c: 3, m: "v", guid, guidsub });
   await sleep(300);
-  emit(ws, "connectToRoom", MAP_ROOM);
+  emit(ws, "connectToRoom", ROOM);
   await sleep(400);
 
   const payload = {
@@ -157,23 +126,7 @@ async function sendRecord(time) {
   emit(ws, "newscore", payload);
   console.log(">>> NEWSCORE SENT: " + time.toFixed(3) + "c");
   await sleep(2000);
-  try { ws.close(); } catch (e) {}
-}
-
-async function checkTop() {
-  let top = [];
-  try { top = await fetchScores(MAP_ROOM); }
-  catch (e) { return { status: "err", msg: e.message }; }
-
-  let ourBest = Infinity, ourEntry = null;
-  for (const s of top) {
-    if (s && s.nick && s.nick.includes(NICK)) {
-      const tt = parseFloat(s.time);
-      if (!isNaN(tt) && tt < ourBest) { ourBest = tt; ourEntry = s; }
-    }
-  }
-  if (ourEntry) return { status: "in_top", topTime: ourBest };
-  return { status: "empty", topTime: null };
+  ws.close();
 }
 
 let autoCheckRunning = false;
@@ -182,556 +135,335 @@ async function autoCheck() {
   autoCheckRunning = true;
   try {
     const now = Date.now();
-    if (BEST_TIME >= 999) {
-      console.log("[AUTO] нет локального финиша — нечего отправлять");
-      autoCheckRunning = false;
-      return;
+    if (now - STATE.lastSent < COOLDOWN_MS) { autoCheckRunning = false; return; }
+    if (BEST_RECORD >= 999) { autoCheckRunning = false; return; }
+    let top = [];
+    try { top = await fetchTop(); } catch (e) { autoCheckRunning = false; return; }
+    let ourBest = Infinity, ourEntry = null;
+    for (const s of top) {
+      if (s && s.nick && s.nick.includes(NICK)) {
+        const tt = parseFloat(s.time);
+        if (!isNaN(tt) && tt < ourBest) { ourBest = tt; ourEntry = s; }
+      }
     }
-
-    console.log("[AUTO] проверка топа | локальный: " + BEST_TIME.toFixed(3) + "c | отправленный: " + (STATE.bestSent === 999 ? "—" : STATE.bestSent.toFixed(3) + "c"));
-
-    const res = await checkTop();
-    if (res.status === "err") {
-      console.log("[AUTO] ошибка топа: " + res.msg);
-      autoCheckRunning = false;
-      return;
-    }
-
-    if (res.status === "in_top") {
-      console.log("[AUTO] наш ник в топе (" + res.topTime.toFixed(3) + "c) — ждём пока исчезнет");
-      autoCheckRunning = false;
-      return;
-    }
-
-    if (BEST_TIME >= STATE.bestSent) {
-      console.log("[AUTO] новый (" + BEST_TIME.toFixed(3) + ") не лучше отправленного (" + STATE.bestSent.toFixed(3) + ") — пропуск");
-      autoCheckRunning = false;
-      return;
-    }
-
-    console.log("[AUTO] отправляем: " + BEST_TIME.toFixed(3) + "c");
-    await sendRecord(BEST_TIME);
-    STATE.bestSent = BEST_TIME;
+    if (ourEntry && ourBest <= BEST_RECORD) { STATE.lastSent = now; saveState(); autoCheckRunning = false; return; }
+    console.log("[AUTO] sending " + BEST_RECORD.toFixed(3) + "c");
+    await sendRecord(BEST_RECORD);
     STATE.lastSent = now;
+    STATE.bestSent = BEST_RECORD;
     saveState();
-    console.log("[AUTO] отправлено. Проверка через 5 минут");
-  } catch (e) {
-    console.log("[AUTO] err: " + e.message);
-  }
+  } catch (e) {}
   autoCheckRunning = false;
 }
 
-async function collectDemos() {
-  const dir = "demos/" + MAP_ID;
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const count = () => { try { return fs.readdirSync(dir).filter(f => f.endsWith(".gz")).length; } catch (e) { return 0; } };
+let DEMOS = [];
+for (let i = 0; i < 40; i++) {
+  try {
+    const d = JSON.parse(zlib.gunzipSync(fs.readFileSync("demo_" + i + ".gz")).toString("utf-8"));
+    const path = d.frames.map(f => ({ x: f.x/1e5, y: f.y/1e5, z: f.z/1e5, t: f.t }));
+    if (path.length < 5) continue;
+    DEMOS.push({ path, time: path[path.length-1].t });
+  } catch (e) {}
+}
+if (!DEMOS.length) { console.log("no demos"); process.exit(1); }
+console.log("loaded " + DEMOS.length + " demos");
 
-  let have = count();
-  console.log("[" + MAP_ID + "] старт: " + have + " демок | цель " + TARGET_DEMOS);
-  const tStart = Date.now();
-  let round = 0;
+const minT = Math.min(...DEMOS.map(d => d.time));
+const maxT = Math.max(...DEMOS.map(d => d.time));
+for (const d of DEMOS) d.weight = 3.0 - 2.0 * (d.time - minT) / Math.max(maxT - minT, 0.001);
 
-  while (have < TARGET_DEMOS && Date.now() - tStart < MAX_COLLECT_MS) {
-    round++;
-    let scores = [];
-    try { scores = await fetchScores(MAP_ROOM); }
-    catch (e) { console.log("[" + MAP_ID + "] fetch err: " + e.message); await sleep(2000); continue; }
+const FINISH = DEMOS[0].path[DEMOS[0].path.length-1];
+const SPAWN = DEMOS[0].path[0];
 
-    const left = Math.round((MAX_COLLECT_MS - (Date.now() - tStart)) / 1000);
-    console.log("[" + MAP_ID + "] round " + round + " — " + scores.length + " записей | есть " + have + "/" + TARGET_DEMOS + " | осталось " + left + "с");
-
-    let got = 0;
-    for (let i = 0; i < scores.length && have < TARGET_DEMOS; i++) {
-      if (Date.now() - tStart > MAX_COLLECT_MS) break;
-      const s = scores[i];
-      if (!s.demoFile || !s.nick) continue;
-      const k = MAP_ID + ":" + s.nick;
-      if (SEEN[k] === "ok") continue;
-      const fails = SEEN[k + ":fails"] || 0;
-      if (fails >= 2) { SEEN[k] = "dead"; saveSeen(); continue; }
-
-      process.stdout.write("  " + s.nick + " | " + s.time + " | ");
-      const { buf, status } = await download(s.demoFile);
-      if (buf && buf.length > 100) {
-        const safe = s.nick.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40);
-        try {
-          fs.writeFileSync(dir + "/" + safe + ".gz", buf);
-          SEEN[k] = "ok"; SEEN[k + ":fails"] = 0; saveSeen();
-          have++; got++;
-          console.log("OK " + buf.length + "b → " + have + "/" + TARGET_DEMOS);
-        } catch (e) { console.log("write err"); }
-      } else {
-        SEEN[k + ":fails"] = fails + 1;
-        saveSeen();
-        console.log("fail [" + status + "]");
-      }
-      await sleep(300);
-    }
-    if (have >= TARGET_DEMOS) break;
-    if (got === 0) await sleep(3000);
+const SAFE = new Set();
+const YMAP = {};
+const CELL = 1.0;
+for (const d of DEMOS) for (const f of d.path) {
+  const k = Math.round(f.x/CELL)+","+Math.round(f.z/CELL);
+  SAFE.add(k);
+  if (YMAP[k] === undefined) YMAP[k] = f.y;
+}
+function isSafe(x,z) { return SAFE.has(Math.round(x/CELL)+","+Math.round(z/CELL)); }
+function getY(x,z) {
+  const cx=Math.round(x/CELL), cz=Math.round(z/CELL);
+  if (YMAP[cx+","+cz] !== undefined) return YMAP[cx+","+cz];
+  for (let r=1;r<=5;r++) for (let dx=-r;dx<=r;dx++) for (let dz=-r;dz<=r;dz++) {
+    const k=(cx+dx)+","+(cz+dz);
+    if (YMAP[k] !== undefined) return YMAP[k];
   }
-  console.log("[" + MAP_ID + "] ИТОГ СБОРА: " + have + "/" + TARGET_DEMOS);
-  return have;
+  return SPAWN.y;
 }
 
-const IN = 10, H1 = 64, H2 = 32, OUT = 2;
+const IN=10, H1=48, H2=24, OUT=2;
 function rnd(){ return (Math.random()-0.5)*0.3; }
-function zeros(a){ return Array.isArray(a[0]) ? a.map(r => r.map(()=>0)) : a.map(()=>0); }
-function relu(x){ return x>0?x:0; }
-
-const W = {
-  W1: Array.from({length:H1},()=>Array.from({length:IN},rnd)),
-  B1: Array.from({length:H1},()=>0),
-  W2: Array.from({length:H2},()=>Array.from({length:H1},rnd)),
-  B2: Array.from({length:H2},()=>0),
-  W3: Array.from({length:OUT},()=>Array.from({length:H2},rnd)),
-  B3: Array.from({length:OUT},()=>0),
-  adamT: 0,
-  demos: [], safe: new Set(), ymap: {},
-  spawn: null, finish: null,
-  runs: 0, wins: 0, best: 999,
-  wf: "weights_" + MAP_ID + ".json",
-};
-
+let W1=Array.from({length:H1},()=>Array.from({length:IN},rnd));
+let B1=Array.from({length:H1},()=>0);
+let W2=Array.from({length:H2},()=>Array.from({length:H1},rnd));
+let B2=Array.from({length:H2},()=>0);
+let W3=Array.from({length:OUT},()=>Array.from({length:H2},rnd));
+let B3=Array.from({length:OUT},()=>0);
 try {
-  const ww = JSON.parse(fs.readFileSync(W.wf, "utf-8"));
-  W.W1=ww.W1; W.B1=ww.B1; W.W2=ww.W2; W.B2=ww.B2; W.W3=ww.W3; W.B3=ww.B3;
-  console.log("[" + MAP_ID + "] weights loaded");
-} catch (e) { console.log("[" + MAP_ID + "] fresh weights"); }
+  const w = JSON.parse(fs.readFileSync(WF, "utf-8"));
+  W1=w.W1;B1=w.B1;W2=w.W2;B2=w.B2;W3=w.W3;B3=w.B3;
+  console.log("loaded weights");
+} catch (e) { console.log("fresh"); }
 
-const M = { W1:zeros(W.W1), B1:zeros(W.B1), W2:zeros(W.W2), B2:zeros(W.B2), W3:zeros(W.W3), B3:zeros(W.B3) };
-const V = { W1:zeros(W.W1), B1:zeros(W.B1), W2:zeros(W.W2), B2:zeros(W.B2), W3:zeros(W.W3), B3:zeros(W.B3) };
-
-function loadMap() {
-  const dir = "demos/" + MAP_ID;
-  W.demos = []; W.safe = new Set(); W.ymap = {};
-  if (!fs.existsSync(dir)) { console.log("нет папки"); return false; }
-  const files = fs.readdirSync(dir).filter(f => f.endsWith(".gz"));
-  if (!files.length) { console.log("нет демок"); return false; }
-
-  for (const f of files) {
-    try {
-      const buf = fs.readFileSync(path.join(dir, f));
-      let raw;
-      try { raw = zlib.gunzipSync(buf).toString("utf-8"); }
-      catch (e) { raw = buf.toString("utf-8"); }
-      const d = JSON.parse(raw);
-      if (!d.frames || d.frames.length < 5) continue;
-      const p = d.frames.map(fr => ({ x: fr.x/1e5, y: fr.y/1e5, z: fr.z/1e5, t: fr.t }));
-      W.demos.push({ path: p, time: p[p.length-1].t, nick: d.nick || f });
-    } catch (e) {}
-  }
-  if (!W.demos.length) { console.log("не распарсились"); return false; }
-
-  const CLUSTER_R = 5;
-  function findConsensus(points) {
-    let bestIdx = 0, bestCount = 0;
-    for (let i = 0; i < points.length; i++) {
-      let count = 0;
-      for (let j = 0; j < points.length; j++) {
-        const d = Math.hypot(points[i].x - points[j].x, points[i].z - points[j].z);
-        if (d < CLUSTER_R) count++;
-      }
-      if (count > bestCount) { bestCount = count; bestIdx = i; }
-    }
-    const cluster = [];
-    for (const p of points) {
-      const d = Math.hypot(points[bestIdx].x - p.x, points[bestIdx].z - p.z);
-      if (d < CLUSTER_R) cluster.push(p);
-    }
-    const avgX = cluster.reduce((s,p)=>s+p.x, 0) / cluster.length;
-    const avgY = cluster.reduce((s,p)=>s+p.y, 0) / cluster.length;
-    const avgZ = cluster.reduce((s,p)=>s+p.z, 0) / cluster.length;
-    return { x: avgX, y: avgY, z: avgZ, count: bestCount, total: points.length };
-  }
-
-  const starts = W.demos.map(d => d.path[0]);
-  const ends = W.demos.map(d => d.path[d.path.length-1]);
-  const spawnC = findConsensus(starts);
-  const finishC = findConsensus(ends);
-
-  W.spawn = { x: spawnC.x, y: spawnC.y, z: spawnC.z };
-  W.finish = { x: finishC.x, y: finishC.y, z: finishC.z };
-
-  console.log("[" + MAP_ID + "] СПАВН: " + spawnC.count + "/" + spawnC.total + " → (" + W.spawn.x.toFixed(1) + "," + W.spawn.z.toFixed(1) + ")");
-  console.log("[" + MAP_ID + "] ФИНИШ: " + finishC.count + "/" + finishC.total + " → (" + W.finish.x.toFixed(1) + "," + W.finish.z.toFixed(1) + ")");
-  const distSF = Math.hypot(W.finish.x - W.spawn.x, W.finish.z - W.spawn.z);
-  console.log("[" + MAP_ID + "] дистанция: " + distSF.toFixed(1) + "м");
-
-  const before = W.demos.length;
-  const badDemos = [];
-  W.demos = W.demos.filter(d => {
-    const dStart = Math.hypot(d.path[0].x - W.spawn.x, d.path[0].z - W.spawn.z);
-    const dEnd = Math.hypot(d.path[d.path.length-1].x - W.finish.x, d.path[d.path.length-1].z - W.finish.z);
-    if (dStart > 15 || dEnd > 15) { badDemos.push(d.nick); return false; }
-    return true;
-  });
-  console.log("[" + MAP_ID + "] битых отброшено: " + badDemos.length + " / " + before);
-  console.log("[" + MAP_ID + "] чистых: " + W.demos.length);
-
-  for (const d of W.demos) for (const fr of d.path) {
-    const k = Math.round(fr.x) + "," + Math.round(fr.z);
-    W.safe.add(k);
-    if (W.ymap[k] === undefined) W.ymap[k] = fr.y;
-  }
-  return true;
-}
-
-function isSafe(x, z) { return W.safe.has(Math.round(x) + "," + Math.round(z)); }
-function getY(x, z) {
-  const cx = Math.round(x), cz = Math.round(z);
-  const k = cx + "," + cz;
-  if (W.ymap[k] !== undefined) return W.ymap[k];
-  for (let r = 1; r <= 5; r++) for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) {
-    const kk = (cx+dx) + "," + (cz+dz);
-    if (W.ymap[kk] !== undefined) return W.ymap[kk];
-  }
-  return W.spawn ? W.spawn.y : 0;
-}
-
-function bfsNext(sx, sz, gx, gz) {
-  const key = (x,z) => x + "," + z;
-  const sxC = Math.round(sx), szC = Math.round(sz);
-  const gxC = Math.round(gx), gzC = Math.round(gz);
-  const q = [[sxC,szC]], prev = new Map(); prev.set(key(sxC,szC), null);
-  const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
-  let found = false, n = 0;
-  while (q.length && n++ < 5000) {
-    const [x,z] = q.shift();
-    if (x === gxC && z === gzC) { found = true; break; }
-    for (const [dx,dz] of dirs) {
-      const nx = x+dx, nz = z+dz, k = key(nx,nz);
-      if (!W.safe.has(k) || prev.has(k)) continue;
-      prev.set(k, key(x,z)); q.push([nx,nz]);
-    }
-  }
-  if (!found) return null;
-  let cur = key(gxC,gzC), p = [];
-  while (cur) { const [px,pz] = cur.split(",").map(Number); p.push([px,pz]); cur = prev.get(cur); }
-  p.reverse();
-  if (p.length < 2) return { x: gx, z: gz };
-  const [wx,wz] = p[1];
-  return { x: wx, z: wz };
-}
-
+function relu(x){ return x>0?x:0; }
 function fwd(inp) {
-  const h1 = new Array(H1);
-  for (let i=0;i<H1;i++){ let s=W.B1[i]; for (let j=0;j<IN;j++) s += W.W1[i][j]*inp[j]; h1[i]=relu(s); }
-  const h2 = new Array(H2);
-  for (let i=0;i<H2;i++){ let s=W.B2[i]; for (let j=0;j<H1;j++) s += W.W2[i][j]*h1[j]; h2[i]=relu(s); }
-  const o = new Array(OUT);
-  for (let i=0;i<OUT;i++){ let s=W.B3[i]; for (let j=0;j<H2;j++) s += W.W3[i][j]*h2[j]; o[i]=Math.tanh(s); }
-  return { o, h1, h2 };
+  const h1=new Array(H1);
+  for(let i=0;i<H1;i++){let s=B1[i];for(let j=0;j<IN;j++)s+=W1[i][j]*inp[j];h1[i]=relu(s);}
+  const h2=new Array(H2);
+  for(let i=0;i<H2;i++){let s=B2[i];for(let j=0;j<H1;j++)s+=W2[i][j]*h1[j];h2[i]=relu(s);}
+  const o=new Array(OUT);
+  for(let i=0;i<OUT;i++){let s=B3[i];for(let j=0;j<H2;j++)s+=W3[i][j]*h2[j];o[i]=Math.tanh(s);}
+  return {o,h1,h2};
 }
-
-function mkIn(x, z, px, pz) {
-  const dx = W.finish.x - x, dz = W.finish.z - z;
-  const dist = Math.hypot(dx, dz) || 1;
-  const vx = x - px, vz = z - pz;
-  return [ dx/100, dz/100, dx/dist, dz/dist, dist/100, vx/SPEED, vz/SPEED, Math.sin(x/50), Math.sin(z/50), dist < 20 ? 1 : 0 ];
+function mkIn(x,z,px,pz) {
+  const dx=FINISH.x-x, dz=FINISH.z-z;
+  const dist=Math.hypot(dx,dz)||1;
+  const vx=x-px, vz=z-pz;
+  return [dx/100,dz/100,dx/dist,dz/dist,dist/100,vx/SPEED,vz/SPEED,Math.sin(x/50),Math.sin(z/50),dist<20?1:0];
 }
-
-function mkTgt(cx, cz, nx, nz) {
-  let dx = nx - cx, dz = nz - cz;
-  const l = Math.hypot(dx, dz) || 1;
+function mkTgt(cx,cz,nx,nz) {
+  let dx=nx-cx, dz=nz-cz;
+  const l=Math.hypot(dx,dz)||1;
   return [dx/l, dz/l];
 }
 
-const B1A = 0.9, B2A = 0.999, EPS = 1e-8;
-function adam(p, g, m, v, lr, scale, T) {
-  scale = scale || 1;
-  if (Array.isArray(p[0])) {
-    for (let i=0;i<p.length;i++) for (let j=0;j<p[i].length;j++) {
-      m[i][j] = B1A*m[i][j] + (1-B1A)*g[i][j];
-      v[i][j] = B2A*v[i][j] + (1-B2A)*g[i][j]*g[i][j];
-      const mh = m[i][j]/(1-Math.pow(B1A,T));
-      const vh = v[i][j]/(1-Math.pow(B2A,T));
-      p[i][j] -= lr*scale*mh/(Math.sqrt(vh)+EPS);
+const B1A=0.9, B2A=0.999, EPS=1e-8;
+function zeros(a){ return Array.isArray(a[0]) ? a.map(r=>r.map(()=>0)) : a.map(()=>0); }
+let M={W1:zeros(W1),B1:zeros(B1),W2:zeros(W2),B2:zeros(B2),W3:zeros(W3),B3:zeros(B3)};
+let V={W1:zeros(W1),B1:zeros(B1),W2:zeros(W2),B2:zeros(B2),W3:zeros(W3),B3:zeros(B3)};
+let t=0;
+function adam(p,g,m,v,lr,scale){
+  scale=scale||1;
+  if(Array.isArray(p[0])){
+    for(let i=0;i<p.length;i++)for(let j=0;j<p[i].length;j++){
+      m[i][j]=B1A*m[i][j]+(1-B1A)*g[i][j];
+      v[i][j]=B2A*v[i][j]+(1-B2A)*g[i][j]*g[i][j];
+      const mh=m[i][j]/(1-Math.pow(B1A,t)), vh=v[i][j]/(1-Math.pow(B2A,t));
+      p[i][j]-=lr*scale*mh/(Math.sqrt(vh)+EPS);
     }
   } else {
-    for (let i=0;i<p.length;i++) {
-      m[i] = B1A*m[i] + (1-B1A)*g[i];
-      v[i] = B2A*v[i] + (1-B2A)*g[i]*g[i];
-      const mh = m[i]/(1-Math.pow(B1A,T));
-      const vh = v[i]/(1-Math.pow(B2A,T));
-      p[i] -= lr*scale*mh/(Math.sqrt(vh)+EPS);
+    for(let i=0;i<p.length;i++){
+      m[i]=B1A*m[i]+(1-B1A)*g[i];
+      v[i]=B2A*v[i]+(1-B2A)*g[i]*g[i];
+      const mh=m[i]/(1-Math.pow(B1A,t)), vh=v[i]/(1-Math.pow(B2A,t));
+      p[i]-=lr*scale*mh/(Math.sqrt(vh)+EPS);
     }
   }
 }
-
-function backprop(inp, tgt, lr, scale) {
-  const { o, h1, h2 } = fwd(inp);
-  const dO = [ 2*(o[0]-tgt[0]), 2*(o[1]-tgt[1]) ];
-  for (let i=0;i<OUT;i++) if (Math.abs(dO[i])>1) dO[i]=Math.sign(dO[i]);
-
-  const gW3 = Array.from({length:OUT}, () => Array(H2).fill(0));
-  const gB3 = dO.slice();
-  for (let i=0;i<OUT;i++) for (let j=0;j<H2;j++) gW3[i][j] = dO[i]*h2[j];
-
-  const dH2 = new Array(H2).fill(0);
-  for (let j=0;j<H2;j++) {
-    for (let i=0;i<OUT;i++) dH2[j] += dO[i]*W.W3[i][j];
-    if (h2[j] <= 0) dH2[j] = 0;
-    if (Math.abs(dH2[j]) > 1) dH2[j] = Math.sign(dH2[j]);
+function backprop(inp,tgt,lr,scale){
+  const {o,h1,h2}=fwd(inp);
+  const dO=[2*(o[0]-tgt[0]),2*(o[1]-tgt[1])];
+  for(let i=0;i<OUT;i++) if(Math.abs(dO[i])>1) dO[i]=Math.sign(dO[i]);
+  const gW3=Array.from({length:OUT},()=>Array(H2).fill(0));
+  const gB3=dO.slice();
+  for(let i=0;i<OUT;i++)for(let j=0;j<H2;j++)gW3[i][j]=dO[i]*h2[j];
+  const dH2=new Array(H2).fill(0);
+  for(let j=0;j<H2;j++){
+    for(let i=0;i<OUT;i++)dH2[j]+=dO[i]*W3[i][j];
+    if(h2[j]<=0)dH2[j]=0;
+    if(Math.abs(dH2[j])>1)dH2[j]=Math.sign(dH2[j]);
   }
-  const gW2 = Array.from({length:H2}, () => Array(H1).fill(0));
-  const gB2 = dH2.slice();
-  for (let i=0;i<H2;i++) for (let j=0;j<H1;j++) gW2[i][j] = dH2[i]*h1[j];
-
-  const dH1 = new Array(H1).fill(0);
-  for (let j=0;j<H1;j++) {
-    for (let i=0;i<H2;i++) dH1[j] += dH2[i]*W.W2[i][j];
-    if (h1[j] <= 0) dH1[j] = 0;
-    if (Math.abs(dH1[j]) > 1) dH1[j] = Math.sign(dH1[j]);
+  const gW2=Array.from({length:H2},()=>Array(H1).fill(0));
+  const gB2=dH2.slice();
+  for(let i=0;i<H2;i++)for(let j=0;j<H1;j++)gW2[i][j]=dH2[i]*h1[j];
+  const dH1=new Array(H1).fill(0);
+  for(let j=0;j<H1;j++){
+    for(let i=0;i<H2;i++)dH1[j]+=dH2[i]*W2[i][j];
+    if(h1[j]<=0)dH1[j]=0;
+    if(Math.abs(dH1[j])>1)dH1[j]=Math.sign(dH1[j]);
   }
-  const gW1 = Array.from({length:H1}, () => Array(IN).fill(0));
-  const gB1 = dH1.slice();
-  for (let i=0;i<H1;i++) for (let j=0;j<IN;j++) gW1[i][j] = dH1[i]*inp[j];
-
-  W.adamT++;
-  adam(W.W1, gW1, M.W1, V.W1, lr, scale, W.adamT);
-  adam(W.B1, gB1, M.B1, V.B1, lr, scale, W.adamT);
-  adam(W.W2, gW2, M.W2, V.W2, lr, scale, W.adamT);
-  adam(W.B2, gB2, M.B2, V.B2, lr, scale, W.adamT);
-  adam(W.W3, gW3, M.W3, V.W3, lr, scale, W.adamT);
-  adam(W.B3, gB3, M.B3, V.B3, lr, scale, W.adamT);
-  return dO[0]*dO[0] + dO[1]*dO[1];
+  const gW1=Array.from({length:H1},()=>Array(IN).fill(0));
+  const gB1=dH1.slice();
+  for(let i=0;i<H1;i++)for(let j=0;j<IN;j++)gW1[i][j]=dH1[i]*inp[j];
+  t++;
+  adam(W1,gW1,M.W1,V.W1,lr,scale);
+  adam(B1,gB1,M.B1,V.B1,lr,scale);
+  adam(W2,gW2,M.W2,V.W2,lr,scale);
+  adam(B2,gB2,M.B2,V.B2,lr,scale);
+  adam(W3,gW3,M.W3,V.W3,lr,scale);
+  adam(B3,gB3,M.B3,V.B3,lr,scale);
+  return dO[0]*dO[0]+dO[1]*dO[1];
 }
-
-function saveWeights() {
-  try { fs.writeFileSync(W.wf, JSON.stringify({ W1:W.W1, B1:W.B1, W2:W.W2, B2:W.B2, W3:W.W3, B3:W.B3 })); } catch (e) {}
+function saveW(){ fs.writeFileSync(WF, JSON.stringify({W1,B1,W2,B2,W3,B3})); }
+function saveBackup(){ fs.writeFileSync(WB, JSON.stringify({W1,B1,W2,B2,W3,B3})); }
+function loadBackup(){
+  try {
+    const w=JSON.parse(fs.readFileSync(WB,"utf-8"));
+    W1=w.W1;B1=w.B1;W2=w.W2;B2=w.B2;W3=w.W3;B3=w.B3;
+    saveW();
+    return true;
+  } catch(e){ return false; }
 }
-
-function rlUpdate(steps, reward, lr) {
-  if (!steps.length) return;
-  const scale = Math.sign(reward) * Math.min(Math.abs(reward), 0.7);  // было 0.5 — сильнее сигнал
-  for (let i=0; i<steps.length; i++) {
+function train(epochs, lr){
+  lr = lr || 0.003;
+  const samples=[];
+  for (const d of DEMOS) for(let i=1;i<d.path.length-1;i++) {
+    samples.push({ inp:mkIn(d.path[i].x,d.path[i].z,d.path[i-1].x,d.path[i-1].z), tgt:mkTgt(d.path[i].x,d.path[i].z,d.path[i+1].x,d.path[i+1].z), w:d.weight });
+  }
+  console.log("training on " + samples.length + " samples x " + epochs);
+  for(let ep=0;ep<epochs;ep++){
+    let L=0;
+    for(let i=samples.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[samples[i],samples[j]]=[samples[j],samples[i]];}
+    for(const s of samples) L += backprop(s.inp,s.tgt,lr,s.w);
+    if(ep%25===0||ep===epochs-1) console.log("ep "+ep+"/"+epochs+" loss="+(L/samples.length).toFixed(6));
+  }
+  saveW(); saveBackup();
+}
+function rlUpdate(steps, reward, lr){
+  if (steps.length === 0) return;
+  const scale = Math.sign(reward) * Math.min(Math.abs(reward), 0.3);
+  for (let i = 0; i < steps.length; i++) {
     const decay = Math.pow(0.995, steps.length - i);
     backprop(steps[i].inp, steps[i].action, lr, scale * decay);
   }
 }
 
-async function pretrainOnDemo(demo, idx, total) {
-  const tStart = Date.now();
-  const samples = [];
-  for (let i = 1; i < demo.path.length - 1; i++) {
-    samples.push({
-      inp: mkIn(demo.path[i].x, demo.path[i].z, demo.path[i-1].x, demo.path[i-1].z),
-      tgt: mkTgt(demo.path[i].x, demo.path[i].z, demo.path[i+1].x, demo.path[i+1].z)
-    });
-  }
-  if (!samples.length) return;
+async function runBot(){
+  const guid=mkGuid(),guidsub=guid.substring(0,10);
+  const deviceid="a_"+Date.now()+"_"+Math.random().toString(36).substring(2,6);
+  let pos={x:SPAWN.x,y:SPAWN.y,z:SPAWN.z};
+  let prev={x:SPAWN.x,z:SPAWN.z};
+  let rotY=0;
+  const t0=Date.now();
+  const episodeSteps=[];
 
-  let epochs = 0;
-  let lastLog = 0;
-  while (Date.now() - tStart < TRAIN_PER_DEMO_MS) {
-    epochs++;
-    let L = 0;
-    for (let i = samples.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [samples[i], samples[j]] = [samples[j], samples[i]];
-    }
-    for (const s of samples) L += backprop(s.inp, s.tgt, PRETRAIN_LR, 1);
-
-    const elapsed = Date.now() - tStart;
-    if (elapsed - lastLog > 10000) {
-      lastLog = elapsed;
-      console.log("  [" + (idx+1) + "/" + total + "] " + Math.round(elapsed/1000) + "с | эпох " + epochs + " | loss " + (L/samples.length).toFixed(5));
-    }
-  }
-  console.log("  [" + (idx+1) + "/" + total + "] готово, эпох " + epochs);
-}
-
-async function runBot() {
-  const guid = mkGuid(), guidsub = guid.substring(0, 10);
-  const deviceid = "a_" + Date.now() + "_" + Math.random().toString(36).slice(2,6);
-  let pos = { x: W.spawn.x, y: W.spawn.y, z: W.spawn.z };
-  let prev = { x: W.spawn.x, z: W.spawn.z };
-  let rotY = 0;
-  let waypoint = { x: W.finish.x, z: W.finish.z };
-  let stuckCounter = 0;
-  let lastDist = Math.hypot(W.spawn.x - W.finish.x, W.spawn.z - W.finish.z);
-  let jumping = false, jumpTime = 0;
-  const t0 = Date.now();
-  const episodeSteps = [];
-
-  try {
-    const ws = await connectWS("ws://" + ADDR + "/socket.io/?EIO=4&transport=websocket");
-    emit(ws, "register", { _id:"", deviceid, nick:NICK, coin:8400228, os:"Linux", installerName:"com.android.vending", sid:deviceid, version:APP_VER, dt:new Date().toISOString() });
+  try{
+    const ws=await connectWS("ws://"+ADDR+"/socket.io/?EIO=4&transport=websocket");
+    emit(ws,"register",{_id:"",deviceid,nick:NICK,coin:8400228,os:"Linux",installerName:"com.android.vending",sid:deviceid,version:"2.6.3",dt:new Date().toISOString()});
     await sleep(20);
-    emit(ws, "savedata", { _id:"", deviceid, nick:NICK, coin:8400228, os:"Linux", installerName:"com.android.vending", sid:deviceid, version:APP_VER, rank_id:RANK_ID, SelectedFlag:FLAG_ID, SelectedAvatar:AVATAR_ID, guid, userpin:0, refcode:"MVSFN7SE", FirstCase:"True", dt:new Date().toISOString() });
+    emit(ws,"savedata",{_id:"",deviceid,nick:NICK,coin:8400228,os:"Linux",installerName:"com.android.vending",sid:deviceid,version:"2.6.3",rank_id:RANK_ID,SelectedFlag:FLAG_ID,SelectedAvatar:AVATAR_ID,guid,userpin:0,refcode:"MVSFN7SE",FirstCase:"True",dt:new Date().toISOString()});
     await sleep(20);
-    emit(ws, "playerinfo", { nick:NICK, rank_str:RANK_STR, cape_str:"cape-0", rank_id:RANK_ID, flag_id:FLAG_ID, avatar_id:AVATAR_ID, pr:"-", id:guidsub });
+    emit(ws,"playerinfo",{nick:NICK,rank_str:RANK_STR,cape_str:"cape-0",rank_id:RANK_ID,flag_id:FLAG_ID,avatar_id:AVATAR_ID,pr:"-",id:guidsub});
     await sleep(20);
-    emit(ws, "move", { x:pos.x, y:pos.y, z:pos.z, lx:pos.x, ly:pos.y, lz:pos.z, ry:0, rw:1, pr:"-", id:guidsub });
+    emit(ws,"move",{x:pos.x,y:pos.y,z:pos.z,lx:pos.x,ly:pos.y,lz:pos.z,ry:0,rw:1,pr:"-",id:guidsub});
     await sleep(30);
-    emit(ws, "joinroom", { room: MAP_ROOM, v:APP_VER, c:3, m:"v", guid, guidsub });
+    emit(ws,"joinroom",{room:ROOM,v:"2.6.3",c:3,m:"v",guid,guidsub});
     await sleep(50);
-    emit(ws, "connectToRoom", MAP_ROOM);
+    emit(ws,"connectToRoom",ROOM);
     await sleep(100);
 
-    const minTravel = Math.hypot(W.finish.x - W.spawn.x, W.finish.z - W.spawn.z) * 0.7;
+    let step=0, done=false, fell=false;
+    while(step<150&&ws.readyState===1){
+      const inp=mkIn(pos.x,pos.z,prev.x,prev.z);
+      const {o}=fwd(inp);
+      let dirX=o[0], dirZ=o[1];
+      const dl=Math.hypot(dirX,dirZ);
+      if (dl < 0.15) { dirX = FINISH.x-pos.x; dirZ = FINISH.z-pos.z; }
+      const dl2=Math.hypot(dirX,dirZ)||1;
+      dirX/=dl2; dirZ/=dl2;
 
-    let step = 0, done = false, fell = false;
-    while (step < EPISODE_STEPS && ws.readyState === 1) {
-      const inp = mkIn(pos.x, pos.z, prev.x, prev.z);
-      const { o } = fwd(inp);
+      let dx=dirX*SPEED, dz=dirZ*SPEED;
+      let nx=pos.x+dx, nz=pos.z+dz;
 
-      if (step % 6 === 0 || stuckCounter > 4) {
-        const wp = bfsNext(pos.x, pos.z, W.finish.x, W.finish.z);
-        if (wp) waypoint = wp;
-        stuckCounter = 0;
-      }
-
-      let nnX = o[0], nnZ = o[1];
-      const nnMag = Math.hypot(nnX, nnZ);
-      if (nnMag > 1e-6) { nnX /= nnMag; nnZ /= nnMag; }
-
-      const eps = Math.max(0.02, 0.3 * Math.exp(-W.runs / 100));
-      nnX += (Math.random()*2-1) * eps;
-      nnZ += (Math.random()*2-1) * eps;
-
-      let wpX = waypoint.x - pos.x, wpZ = waypoint.z - pos.z;
-      const wpLen = Math.hypot(wpX, wpZ) || 1; wpX /= wpLen; wpZ /= wpLen;
-      const nnW = Math.min(1, nnMag / 0.6);
-      let dirX = nnX*nnW + wpX*(1-nnW);
-      let dirZ = nnZ*nnW + wpZ*(1-nnW);
-      const dl = Math.hypot(dirX, dirZ) || 1;
-      dirX /= dl; dirZ /= dl;
-
-      let dx = dirX * SPEED, dz = dirZ * SPEED;
-      let nx = pos.x + dx, nz = pos.z + dz;
-
-      if (!isSafe(nx, nz)) {
-        let found = false;
-        for (let k = 1; k <= 12; k++) {
-          const angles = [k*Math.PI/12, -k*Math.PI/12];
-          for (const a of angles) {
-            const baseAng = Math.atan2(dirZ, dirX);
-            const newAng = baseAng + a;
-            const tx = pos.x + Math.cos(newAng)*SPEED;
-            const tz = pos.z + Math.sin(newAng)*SPEED;
-            if (isSafe(tx, tz)) { nx = tx; nz = tz; dx = tx - pos.x; dz = tz - pos.z; found = true; break; }
+      if (!isSafe(nx,nz)) {
+        let found=false;
+        for(let k=1;k<=12;k++){
+          const angles=[k*Math.PI/12,-k*Math.PI/12];
+          for(const a of angles){
+            const baseAng=Math.atan2(dirZ,dirX);
+            const newAng=baseAng+a;
+            const tx=pos.x+Math.cos(newAng)*SPEED;
+            const tz=pos.z+Math.sin(newAng)*SPEED;
+            if(isSafe(tx,tz)){nx=tx;nz=tz;dx=tx-pos.x;dz=tz-pos.z;found=true;break;}
           }
-          if (found) break;
+          if(found)break;
         }
-        if (!found) { fell = true; break; }
+        if(!found){ fell=true; break; }
       }
-
-      const oldX = pos.x, oldY = pos.y, oldZ = pos.z;
-      const oldRotY = rotY;
 
       episodeSteps.push({
         inp,
-        action: [ dx/(SPEED*Math.SQRT2), dz/(SPEED*Math.SQRT2) ],
+        action: [dx/(SPEED*Math.SQRT2), dz/(SPEED*Math.SQRT2)],
         posX: pos.x, posY: pos.y, posZ: pos.z
       });
 
-      prev = { x: pos.x, z: pos.z };
-      pos.x = nx; pos.z = nz;
-      pos.y = getY(pos.x, pos.z);
+      prev={x:pos.x,z:pos.z};
+      pos.x=nx; pos.z=nz;
+      pos.y=getY(pos.x,pos.z);
+      if(Math.abs(dx)>0.05||Math.abs(dz)>0.05) rotY=Math.atan2(dx,dz);
 
-      const targetYaw = Math.atan2(dx, dz);
-      let dyaw = targetYaw - rotY;
-      while (dyaw > Math.PI) dyaw -= 2*Math.PI;
-      while (dyaw < -Math.PI) dyaw += 2*Math.PI;
-      if (Math.abs(dyaw) > MAX_TURN) dyaw = Math.sign(dyaw) * MAX_TURN;
-      rotY += dyaw;
+      emit(ws,"move",{x:pos.x,y:pos.y,z:pos.z,lx:pos.x,ly:pos.y,lz:pos.z,ry:rotY,rw:1,pr:"-",id:guidsub});
 
-      let jumpOffset = 0;
-      if (jumping) {
-        jumpTime += 0.08;
-        if (jumpTime < JUMP_DUR) {
-          jumpOffset = JUMP_H * (1 - Math.pow((jumpTime - JUMP_DUR/2)/(JUMP_DUR/2), 2));
-          if (jumpOffset < 0) jumpOffset = 0;
-        } else { jumping = false; jumpTime = 0; }
-      }
-      if (!jumping && Math.random() < 0.05) { jumping = true; jumpTime = 0; }
-
-      for (let s = 1; s <= SUBSTEPS; s++) {
-        const k = s / SUBSTEPS;
-        let ix = oldX + (pos.x - oldX) * k;
-        let iy = oldY + (pos.y - oldY) * k + jumpOffset * k;
-        let iz = oldZ + (pos.z - oldZ) * k;
-        ix += (Math.random()-0.5) * 0.006;
-        iz += (Math.random()-0.5) * 0.006;
-        const iYaw = oldRotY + (rotY - oldRotY) * k;
-        const qy = Math.sin(iYaw/2), qw = Math.cos(iYaw/2);
-        const lx = ix + Math.sin(iYaw)*0.5;
-        const lz = iz + Math.cos(iYaw)*0.5;
-        emit(ws, "move", { x:ix, y:iy, z:iz, lx:lx, ly:iy, lz:lz, ry:qy, rw:qw, pr:"-", id:guidsub });
-        await sleep(STEP_SLEEP);
-      }
-
-      const dNow = Math.hypot(pos.x - W.finish.x, pos.z - W.finish.z);
-      if (dNow > lastDist - 0.05) stuckCounter++; else stuckCounter = 0;
-      lastDist = dNow;
-
-      const dist3 = Math.hypot(pos.x - W.finish.x, pos.y - W.finish.y, pos.z - W.finish.z);
-      const distFromSpawn = Math.hypot(pos.x - W.spawn.x, pos.z - W.spawn.z);
-      if (dist3 < FINISH_RADIUS && distFromSpawn > minTravel) { done = true; break; }
+      const dist3=Math.hypot(pos.x-FINISH.x,pos.y-FINISH.y,pos.z-FINISH.z);
+      if(dist3<3){ done=true; break; }
+      if(step%25===0) console.log("step "+step+" pos=("+pos.x.toFixed(1)+","+pos.z.toFixed(1)+") dist="+dist3.toFixed(1));
       step++;
+      await sleep(80);
     }
-    try { ws.close(); } catch (e) {}
-    const elapsed = (Date.now() - t0) / 1000;
-    return { done, fell, elapsed, steps: episodeSteps };
-  } catch (e) {
-    return { done: false, fell: true, elapsed: 99, steps: episodeSteps };
-  }
+    ws.close();
+    const elapsed = (Date.now()-t0)/1000;
+    return {done, fell, elapsed, steps: episodeSteps};
+  }catch(e){console.log("err "+e.message);return {done:false, fell:true, elapsed:99, steps:episodeSteps};}
 }
 
-(async () => {
-  console.log("=== uxuxx ai SOLO — " + MAP_ID + " — ускоренное обучение ===\n");
-  console.log("Локальный: " + (BEST_TIME === 999 ? "—" : BEST_TIME.toFixed(3) + "c"));
-  console.log("Отправленный: " + (STATE.bestSent === 999 ? "—" : STATE.bestSent.toFixed(3) + "c") + "\n");
-
-  console.log("=== ЭТАП 1: СБОР ДЕМОК (до 15, макс 10 мин) ===");
-  await collectDemos();
-
-  console.log("\n=== ЭТАП 2: ЗАГРУЗКА КАРТЫ ===");
-  if (!loadMap()) { console.log("НЕТ КАРТЫ — выход"); process.exit(1); }
-
-  console.log("\n=== ЭТАП 3: ПРЕДОБУЧЕНИЕ (по 120с на демку, lr=" + PRETRAIN_LR + ") ===");
-  for (let i = 0; i < W.demos.length; i++) {
-    await pretrainOnDemo(W.demos[i], i, W.demos.length);
+(async()=>{
+  console.log("=== " + NICK + " ===");
+  if(!fs.existsSync(WF)){
+    console.log("no weights, first train 200 epochs...");
+    train(200, 0.003);
+  } else {
+    console.log("weights loaded");
   }
-  saveWeights();
-  console.log("=== ПРЕДОБУЧЕНИЕ ЗАВЕРШЕНО ===\n");
+  console.log("\n=== infinite walk ===\n");
 
   setInterval(autoCheck, AUTO_CHECK_MS);
 
-  console.log("=== ЭТАП 4: ИГРА + ОНЛАЙН-ОБУЧЕНИЕ + ОТПРАВКА (lr=" + RL_LR + ") ===\n");
-  let globalRun = 0;
-  while (true) {
-    globalRun++;
-    const r = await runBot();
-    W.runs++;
+  let wins=0, runs=0, fails=0;
+  let bestTime = BEST_RECORD;
+
+  while(true){
+    runs++;
+    const r=await runBot();
 
     if (r.done) {
-      W.wins++;
-      const finished = r.elapsed;
-      if (finished < W.best) W.best = finished;
+      wins++;
+      fails = 0;
+      saveBackup();
 
-      if (finished < BEST_TIME) {
-        BEST_TIME = finished;
-        fs.writeFileSync(RECORD_FILE, BEST_TIME.toFixed(3));
-        console.log("[" + MAP_ID + "] FINISH " + finished.toFixed(2) + "s  ★ ЛОКАЛЬНЫЙ РЕКОРД ★");
-      } else {
-        console.log("[" + MAP_ID + "] FINISH " + finished.toFixed(2) + "s (best " + W.best.toFixed(2) + ")");
+      let reward = Math.max(0.3, 5 - r.elapsed);
+      let doRL = false;
+      if (r.elapsed < bestTime) {
+        bestTime = r.elapsed;
+        reward += 1;
+        doRL = true;
       }
+      if (r.elapsed < BEST_RECORD) {
+        BEST_RECORD = r.elapsed;
+        saveTop(r.elapsed, r.steps);
+        console.log(">>> NEW ALL-TIME RECORD! " + r.elapsed.toFixed(3) + "c");
+      }
+      console.log(">>> FINISH! time=" + r.elapsed.toFixed(2) + "s reward=" + reward.toFixed(1) + " best=" + bestTime.toFixed(2) + (doRL?" [RL]":""));
 
-      const reward = 25.0 - finished;   // цель 16с → reward +9
-      if (r.steps.length) rlUpdate(r.steps, reward, RL_LR);
-      saveWeights();
+      if (doRL && r.steps.length > 0) rlUpdate(r.steps, reward, RL_LR);
     } else if (r.fell) {
-      console.log("[" + MAP_ID + "] FELL " + r.elapsed.toFixed(2) + "s");
-      if (r.steps.length) rlUpdate(r.steps, -2.0, RL_LR);
+      fails++;
+      console.log(">>> FELL at " + r.elapsed.toFixed(2) + "s (fails=" + fails + "/" + MAX_FAILS + ")");
     } else {
-      console.log("[" + MAP_ID + "] TIMEOUT " + r.elapsed.toFixed(2) + "s");
-      if (r.steps.length) rlUpdate(r.steps, -1.5, RL_LR);
+      fails++;
+      console.log(">>> TIMEOUT " + r.elapsed.toFixed(2) + "s (fails=" + fails + "/" + MAX_FAILS + ")");
     }
 
-    if (globalRun % 30 === 0) saveWeights();
-    await sleep(20);
+    if (fails >= MAX_FAILS) {
+      console.log("!!! " + MAX_FAILS + " FAILS IN A ROW → ROLLBACK");
+      if (loadBackup()) {
+        fails = 0;
+        console.log(">>> weights restored, continuing...");
+      } else {
+        console.log(">>> no backup, retraining...");
+        train(50, 0.002);
+        saveBackup();
+        fails = 0;
+      }
+    }
+
+    if (runs % 10 === 0 && fails === 0) {
+      saveW();
+      console.log("--- saved (runs=" + runs + ", wins=" + wins + ", best=" + bestTime.toFixed(2) + "s, ALL-TIME=" + BEST_RECORD.toFixed(3) + "c) ---");
+    }
+
+    await sleep(10);
   }
 })();
