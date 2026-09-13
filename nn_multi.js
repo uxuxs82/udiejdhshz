@@ -14,15 +14,16 @@ const FLAG_ID = "flags_30";
 const AVATAR_ID = 8;
 const APP_VER = "2.6.3";
 
-const COLLECT_TIME_MS = 3 * 60 * 1000;  // 3 минуты на ВСЕ карты
-const TARGET_DEMOS = 15;
+const TARGET_DEMOS = 10;
+const COLLECT_PER_MAP_MS = 3 * 60 * 1000;
+const MAX_STUCK_ROUNDS = 4;
 const RL_LR = 0.0005;
 const SPEED = 1.5;
 const MAX_TURN = 0.12;
 const SUBSTEPS = 6;
 const JUMP_H = 1.2;
 const JUMP_DUR = 0.5;
-const EPISODE_STEPS = 150;
+const EPISODE_STEPS = 700;
 const STEP_SLEEP = 6;
 
 const MAPS = [
@@ -105,70 +106,63 @@ async function fetchScores(room) {
   return topScores;
 }
 
-// Собирает демки для ВСЕХ карт, общий таймер 3 минуты
-async function collectAllDemos() {
-  console.log("=== СБОР ДЕМОК (общий лимит 3 минуты) ===");
+async function collectDemosForMap(map) {
+  const dir = "demos/" + map.id;
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const count = () => { try { return fs.readdirSync(dir).filter(f => f.endsWith(".gz")).length; } catch (e) { return 0; } };
+
+  let have = count();
+  console.log("\n[" + map.id + "] старт: " + have + " демок | лимит 3 минуты | цель " + TARGET_DEMOS);
   const tStart = Date.now();
-  const left = () => Math.max(0, COLLECT_TIME_MS - (Date.now() - tStart));
+  let round = 0;
+  let stuckRounds = 0;
 
-  for (const map of MAPS) {
-    if (left() <= 5000) { console.log("[" + map.id + "] времени не осталось — пропуск"); continue; }
+  while (have < TARGET_DEMOS && Date.now() - tStart < COLLECT_PER_MAP_MS && stuckRounds < MAX_STUCK_ROUNDS) {
+    round++;
+    let scores = [];
+    try { scores = await fetchScores(map.room); }
+    catch (e) { console.log("[" + map.id + "] fetch err: " + e.message); await sleep(2000); continue; }
 
-    const dir = "demos/" + map.id;
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const count = () => { try { return fs.readdirSync(dir).filter(f => f.endsWith(".gz")).length; } catch (e) { return 0; } };
+    const left = Math.round((COLLECT_PER_MAP_MS - (Date.now() - tStart)) / 1000);
+    console.log("[" + map.id + "] round " + round + " — " + scores.length + " записей | есть " + have + "/" + TARGET_DEMOS + " | осталось " + left + "с");
 
-    let have = count();
-    console.log("\n[" + map.id + "] старт: уже есть " + have + " демок | осталось " + Math.round(left()/1000) + "с");
+    let got = 0;
+    for (let i = 0; i < scores.length && have < TARGET_DEMOS; i++) {
+      if (Date.now() - tStart > COLLECT_PER_MAP_MS) break;
 
-    let round = 0;
-    while (have < TARGET_DEMOS && left() > 5000) {
-      round++;
-      let scores = [];
-      try { scores = await fetchScores(map.room); }
-      catch (e) { console.log("[" + map.id + "] fetch err: " + e.message); await sleep(2000); continue; }
+      const s = scores[i];
+      if (!s.demoFile || !s.nick) continue;
+      const k = map.id + ":" + s.nick;
+      if (SEEN[k] === "ok") continue;
+      const fails = SEEN[k + ":fails"] || 0;
+      if (fails >= 2) { SEEN[k] = "dead"; saveSeen(); continue; }
 
-      console.log("[" + map.id + "] round " + round + " — " + scores.length + " записей | есть " + have + "/" + TARGET_DEMOS + " | осталось " + Math.round(left()/1000) + "с");
-
-      let got = 0;
-      for (let i = 0; i < scores.length && have < TARGET_DEMOS; i++) {
-        if (left() <= 3000) break;
-
-        const s = scores[i];
-        if (!s.demoFile || !s.nick) continue;
-        const k = map.id + ":" + s.nick;
-        if (SEEN[k] === "ok") continue;
-        const fails = SEEN[k + ":fails"] || 0;
-        if (fails >= 2) { SEEN[k] = "dead"; saveSeen(); continue; }
-
-        process.stdout.write("  " + s.nick + " | " + s.time + " | ");
-        const { buf, status } = await download(s.demoFile);
-        if (buf && buf.length > 100) {
-          const safe = s.nick.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40);
-          try {
-            fs.writeFileSync(dir + "/" + safe + ".gz", buf);
-            SEEN[k] = "ok";
-            SEEN[k + ":fails"] = 0;
-            saveSeen();
-            have++; got++;
-            console.log("OK " + buf.length + "b → " + have + "/" + TARGET_DEMOS);
-          } catch (e) { console.log("write err"); }
-        } else {
-          SEEN[k + ":fails"] = fails + 1;
+      process.stdout.write("  " + s.nick + " | " + s.time + " | ");
+      const { buf, status } = await download(s.demoFile);
+      if (buf && buf.length > 100) {
+        const safe = s.nick.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40);
+        try {
+          fs.writeFileSync(dir + "/" + safe + ".gz", buf);
+          SEEN[k] = "ok";
+          SEEN[k + ":fails"] = 0;
           saveSeen();
-          console.log("fail [" + status + "]");
-        }
-        await sleep(300);
+          have++; got++;
+          console.log("OK " + buf.length + "b → " + have + "/" + TARGET_DEMOS);
+        } catch (e) { console.log("write err"); }
+      } else {
+        SEEN[k + ":fails"] = fails + 1;
+        saveSeen();
+        console.log("fail [" + status + "]");
       }
-
-      if (have >= TARGET_DEMOS) break;
-      if (got === 0) await sleep(2000);
+      await sleep(300);
     }
 
-    console.log("[" + map.id + "] СОБРАНО: " + have + " демок");
+    if (have >= TARGET_DEMOS) break;
+    if (got === 0) { stuckRounds++; await sleep(2000); } else stuckRounds = 0;
   }
 
-  console.log("\n=== СБОР ЗАВЕРШЁН за " + Math.round((Date.now()-tStart)/1000) + "с ===");
+  console.log("[" + map.id + "] СОБРАНО: " + have + "/" + TARGET_DEMOS);
+  return have;
 }
 
 const IN = 10, H1 = 48, H2 = 24, OUT = 2;
@@ -191,13 +185,11 @@ function makeWorker(mapId, room) {
     runs: 0, wins: 0, best: 999,
     wf: "weights_" + mapId + ".json",
   };
-
   try {
     const ww = JSON.parse(fs.readFileSync(w.wf, "utf-8"));
     w.W1=ww.W1; w.B1=ww.B1; w.W2=ww.W2; w.B2=ww.B2; w.W3=ww.W3; w.B3=ww.B3;
     console.log("[" + mapId + "] weights loaded");
   } catch (e) { console.log("[" + mapId + "] fresh weights"); }
-
   w.M = { W1:zeros(w.W1), B1:zeros(w.B1), W2:zeros(w.W2), B2:zeros(w.B2), W3:zeros(w.W3), B3:zeros(w.B3) };
   w.V = { W1:zeros(w.W1), B1:zeros(w.B1), W2:zeros(w.W2), B2:zeros(w.B2), W3:zeros(w.W3), B3:zeros(w.B3) };
   return w;
@@ -208,7 +200,7 @@ function loadMap(w) {
   w.demos = []; w.safe = new Set(); w.ymap = {};
   if (!fs.existsSync(dir)) { console.log("[" + w.id + "] нет папки"); return false; }
   const files = fs.readdirSync(dir).filter(f => f.endsWith(".gz"));
-  if (!files.length) { console.log("[" + w.id + "] нет демок — карта пропущена"); return false; }
+  if (!files.length) { console.log("[" + w.id + "] нет демок"); return false; }
 
   for (const f of files) {
     try {
@@ -223,14 +215,26 @@ function loadMap(w) {
     } catch (e) {}
   }
   if (!w.demos.length) { console.log("[" + w.id + "] демки не распарсились"); return false; }
-  w.spawn = w.demos[0].path[0];
-  w.finish = w.demos[0].path[w.demos[0].path.length-1];
+
+  const longest = w.demos.reduce((a,b) => a.path.length > b.path.length ? a : b);
+  w.spawn = longest.path[0];
+
+  let bestDist = 0;
+  let bestFinish = longest.path[longest.path.length - 1];
+  for (const d of w.demos) {
+    for (const p of d.path) {
+      const dist = Math.hypot(p.x - w.spawn.x, p.z - w.spawn.z);
+      if (dist > bestDist) { bestDist = dist; bestFinish = p; }
+    }
+  }
+  w.finish = bestFinish;
+
   for (const d of w.demos) for (const fr of d.path) {
     const k = Math.round(fr.x) + "," + Math.round(fr.z);
     w.safe.add(k);
     if (w.ymap[k] === undefined) w.ymap[k] = fr.y;
   }
-  console.log("[" + w.id + "] " + w.demos.length + " демок | spawn(" + w.spawn.x.toFixed(1) + "," + w.spawn.z.toFixed(1) + ") | finish(" + w.finish.x.toFixed(1) + "," + w.finish.z.toFixed(1) + ")");
+  console.log("[" + w.id + "] " + w.demos.length + " демок | spawn(" + w.spawn.x.toFixed(1) + "," + w.spawn.z.toFixed(1) + ") | finish(" + w.finish.x.toFixed(1) + "," + w.finish.z.toFixed(1) + ") | dist " + bestDist.toFixed(1) + "м");
   return true;
 }
 
@@ -253,7 +257,7 @@ function bfsNext(w, sx, sz, gx, gz) {
   const q = [[sxC,szC]], prev = new Map(); prev.set(key(sxC,szC), null);
   const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
   let found = false, n = 0;
-  while (q.length && n++ < 1000) {
+  while (q.length && n++ < 3000) {
     const [x,z] = q.shift();
     if (x === gxC && z === gzC) { found = true; break; }
     for (const [dx,dz] of dirs) {
@@ -500,12 +504,10 @@ async function runBot(w) {
 async function loopWorker(w) {
   console.log("[" + w.id + "] воркер запущен");
   let globalRun = 0;
-
   while (true) {
     globalRun++;
     const r = await runBot(w);
     w.runs++;
-
     if (r.done) {
       w.wins++;
       if (r.elapsed < w.best) w.best = r.elapsed;
@@ -520,19 +522,19 @@ async function loopWorker(w) {
       console.log("[" + w.id + "] TIMEOUT " + r.elapsed.toFixed(2) + "s");
       if (r.steps.length) rlUpdate(w, r.steps, -1.0, RL_LR);
     }
-
     if (globalRun % 30 === 0) saveWeights(w);
     await sleep(20);
   }
 }
 
 (async () => {
-  console.log("=== uxuxx ai MEGA — 4 карты, 4 воркера, один ник ===\n");
+  console.log("=== uxuxx ai MEGA — 4 карты, 4 воркера, 10 демок на карту ===\n");
 
-  // ЭТАП 1: общий сбор демок за 3 минуты
-  await collectAllDemos();
+  console.log("=== СБОР ДЕМОК (3 мин на каждую карту, цель 10) ===");
+  for (const m of MAPS) {
+    await collectDemosForMap(m);
+  }
 
-  // ЭТАП 2: загрузка карт
   console.log("\n=== ЗАГРУЗКА КАРТ ===");
   const workers = [];
   for (const m of MAPS) {
@@ -542,7 +544,6 @@ async function loopWorker(w) {
 
   if (!workers.length) { console.log("НЕТ КАРТ — выход"); process.exit(1); }
 
-  // ЭТАП 3: параллельная игра
-  console.log("\n=== ИГРА + ОБУЧЕНИЕ (4 воркера) ===\n");
+  console.log("\n=== ИГРА + ОБУЧЕНИЕ (" + workers.length + " воркеров) ===\n");
   await Promise.all(workers.map(w => loopWorker(w)));
 })();
