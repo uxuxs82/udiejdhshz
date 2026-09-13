@@ -128,24 +128,13 @@ async function collectDemos() {
   return demos;
 }
 
-let DEMOS = await collectDemos();
-if (!DEMOS.length) { console.log("нет демок — выход"); process.exit(1); }
-
-const minT = Math.min(...DEMOS.map(d => d.time));
-const maxT = Math.max(...DEMOS.map(d => d.time));
-for (const d of DEMOS) d.weight = 3.0 - 2.0 * (d.time - minT) / Math.max(maxT - minT, 0.001);
-
-const FINISH = DEMOS[0].path[DEMOS[0].path.length-1];
-const SPAWN = DEMOS[0].path[0];
-
+let DEMOS = [];
+let FINISH = null;
+let SPAWN = null;
 const SAFE = new Set();
 const YMAP = {};
 const CELL = 1.0;
-for (const d of DEMOS) for (const f of d.path) {
-  const k = Math.round(f.x/CELL)+","+Math.round(f.z/CELL);
-  SAFE.add(k);
-  if (YMAP[k] === undefined) YMAP[k] = f.y;
-}
+
 function isSafe(x,z) { return SAFE.has(Math.round(x/CELL)+","+Math.round(z/CELL)); }
 function getY(x,z) {
   const cx=Math.round(x/CELL), cz=Math.round(z/CELL);
@@ -154,7 +143,7 @@ function getY(x,z) {
     const k=(cx+dx)+","+(cz+dz);
     if (YMAP[k] !== undefined) return YMAP[k];
   }
-  return SPAWN.y;
+  return SPAWN ? SPAWN.y : 0;
 }
 
 const IN=10, H1=48, H2=24, OUT=2;
@@ -250,8 +239,8 @@ function backprop(inp,tgt,lr,scale){
   adam(B3,gB3,M.B3,V.B3,lr,scale);
   return dO[0]*dO[0]+dO[1]*dO[1];
 }
-function saveW(){ fs.writeFileSync(WF, JSON.stringify({W1,B1,W2,B2,W3,B3})); }
-function saveBackup(){ fs.writeFileSync(WB, JSON.stringify({W1,B1,W2,B2,W3,B3})); }
+function saveW(){ try { fs.writeFileSync(WF, JSON.stringify({W1,B1,W2,B2,W3,B3})); } catch(e){} }
+function saveBackup(){ try { fs.writeFileSync(WB, JSON.stringify({W1,B1,W2,B2,W3,B3})); } catch(e){} }
 function loadBackup(){
   try {
     const w=JSON.parse(fs.readFileSync(WB,"utf-8"));
@@ -481,8 +470,26 @@ async function runBot(){
   }catch(e){console.log("err "+e.message);return {done:false, fell:true, elapsed:99, steps:episodeSteps};}
 }
 
-(async()=>{
-  console.log("=== " + NICK + " — 60 pkt/s, плавно, камера по движению ===");
+// ================== ГЛАВНАЯ АСИНХРОННАЯ ФУНКЦИЯ ==================
+(async () => {
+  console.log("=== " + NICK + " — 60 pkt/s, плавно ===");
+
+  DEMOS = await collectDemos();
+  if (!DEMOS.length) { console.log("нет демок — выход"); process.exit(1); }
+
+  const minT = Math.min(...DEMOS.map(d => d.time));
+  const maxT = Math.max(...DEMOS.map(d => d.time));
+  for (const d of DEMOS) d.weight = 3.0 - 2.0 * (d.time - minT) / Math.max(maxT - minT, 0.001);
+
+  FINISH = DEMOS[0].path[DEMOS[0].path.length-1];
+  SPAWN = DEMOS[0].path[0];
+
+  for (const d of DEMOS) for (const f of d.path) {
+    const k = Math.round(f.x/CELL)+","+Math.round(f.z/CELL);
+    SAFE.add(k);
+    if (YMAP[k] === undefined) YMAP[k] = f.y;
+  }
+
   if(!fs.existsSync(WF)){
     console.log("no weights, train 200 epochs...");
     train(200, 0.003);
