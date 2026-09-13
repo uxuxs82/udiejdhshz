@@ -1,9 +1,9 @@
 {
   "name": "bhop-ai",
   "version": "1.0.0",
-  "main": "nn_rl_bundle.js",
+  "main": "nn_multi.js",
   "scripts": {
-    "start": "node nn_rl_bundle.js"
+    "start": "node nn_multi.js"
   },
   "dependencies": {
     "ws": "^8.18.0"
