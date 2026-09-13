@@ -1,9 +1,11 @@
 const WebSocket = require("ws");
+const https = require("https");
 const fs = require("fs");
 const zlib = require("zlib");
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const ADDR = "188.245.236.7:30002";
+const CDN = "infocdn.bhoppro.com";
 const ROOM = "Parkour-Infinity";
 const NICK = "uxuxx ai";
 const WF = "nn_rl_weights.json";
@@ -11,11 +13,14 @@ const WB = "nn_rl_weights_backup.json";
 const SPEED = 1.5;
 const MAX_FAILS = 3;
 const RL_LR = 0.0001;
+const SUBSTEPS = 6;
+const TARGET_DEMOS = 15;
 
 const RANK_ID = 16;
 const RANK_STR = "Master Bhoper Elite";
 const FLAG_ID = "flags_30";
 const AVATAR_ID = 8;
+const APP_VER = "2.6.3";
 
 const TOP_FILE = "./top.txt";
 const RECORD_FILE = "./record.txt";
@@ -29,16 +34,6 @@ function saveState() { try { fs.writeFileSync(STATE_FILE, JSON.stringify(STATE))
 
 let BEST_RECORD = 999;
 try { const n = parseFloat(fs.readFileSync(RECORD_FILE, "utf-8").trim()); if (!isNaN(n)) BEST_RECORD = n; } catch (e) {}
-
-function saveTop(time, steps) {
-  try { fs.writeFileSync(RECORD_FILE, time.toFixed(3)); } catch (e) {}
-  let content = time.toFixed(3) + "c\n";
-  for (let i = 0; i < steps.length; i++) {
-    const s = steps[i];
-    content += "[" + (i+1) + "] t=" + (i*0.08).toFixed(2) + "s x=" + (s.posX||0).toFixed(2) + " y=" + (s.posY||0).toFixed(2) + " z=" + (s.posZ||0).toFixed(2) + "\n";
-  }
-  try { fs.writeFileSync(TOP_FILE, content); } catch (e) {}
-}
 
 function mkGuid(){const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";let g="";for(let i=0;i<22;i++)g+=c[Math.floor(Math.random()*c.length)];return g+"==";}
 const emit=(ws,e,d)=>{if(ws&&ws.readyState===1)ws.send("42"+JSON.stringify([e,d]));};
@@ -58,115 +53,83 @@ function connectWS(url){
   });
 }
 
-async function fetchTop() {
-  const guid = mkGuid(), guidsub = guid.substring(0, 10);
-  const deviceid = "chk_" + Date.now();
-  const ws = await connectWS("ws://" + ADDR + "/socket.io/?EIO=4&transport=websocket");
-  let topScores = [];
-  ws.on("message", raw => {
-    const m = raw.toString();
-    if (m === "2") { ws.send("3"); return; }
-    if (m.startsWith("42")) {
-      try {
-        const arr = JSON.parse(m.substring(2));
-        if (arr[0] === "scores" && arr[1] && arr[1].scores) topScores = arr[1].scores;
-      } catch (e) {}
-    }
-  });
-  emit(ws, "register", { _id: "", deviceid, nick: "chk", coin: 8400228, os: "Linux", installerName: "com.android.vending", sid: deviceid, version: "2.6.3", dt: new Date().toISOString() });
-  await sleep(200);
-  emit(ws, "savedata", { _id: "", deviceid, nick: "chk", coin: 8400228, os: "Linux", installerName: "com.android.vending", sid: deviceid, version: "2.6.3", rank_id: RANK_ID, SelectedFlag: FLAG_ID, SelectedAvatar: AVATAR_ID, guid, userpin: 0, refcode: "MVSFN7SE", FirstCase: "True", dt: new Date().toISOString() });
-  await sleep(200);
-  emit(ws, "playerinfo", { nick: "chk", rank_str: RANK_STR, cape_str: "cape-0", rank_id: RANK_ID, flag_id: FLAG_ID, avatar_id: AVATAR_ID, pr: "-", id: guidsub });
-  await sleep(100);
-  emit(ws, "move", { x: 0, y: 0, z: 0, lx: 0, ly: 0, lz: 0, ry: 0, rw: 0.999, pr: "-", id: guidsub });
-  await sleep(100);
-  emit(ws, "joinroom", { room: ROOM, v: "2.6.3", c: 3, m: "v", guid, guidsub });
-  await sleep(300);
-  emit(ws, "connectToRoom", ROOM);
-  await sleep(4000);
-  ws.close();
-  return topScores;
-}
-
-async function sendRecord(time) {
-  const guid = mkGuid(), guidsub = guid.substring(0, 10);
-  const deviceid = "rec_" + Date.now();
-  const ws = await connectWS("ws://" + ADDR + "/socket.io/?EIO=4&transport=websocket");
-  const tStr = String(Math.floor(time/60)).padStart(2,"0") + ":" + (time%60).toFixed(3).padStart(6,"0");
-
-  emit(ws, "register", { _id: "", deviceid, nick: NICK, coin: 8400228, os: "Linux", installerName: "com.android.vending", sid: deviceid, version: "2.6.3", dt: new Date().toISOString() });
-  await sleep(200);
-  emit(ws, "savedata", { _id: "", deviceid, nick: NICK, coin: 8400228, os: "Linux", installerName: "com.android.vending", sid: deviceid, version: "2.6.3", rank_id: RANK_ID, SelectedFlag: FLAG_ID, SelectedAvatar: AVATAR_ID, guid, userpin: 0, refcode: "MVSFN7SE", FirstCase: "True", dt: new Date().toISOString() });
-  await sleep(200);
-  emit(ws, "playerinfo", { nick: NICK, rank_str: RANK_STR, cape_str: "cape-0", rank_id: RANK_ID, flag_id: FLAG_ID, avatar_id: AVATAR_ID, pr: "-", id: guidsub });
-  await sleep(100);
-  emit(ws, "move", { x: 929.8, y: 169.3, z: -2704.5, lx: 929.8, ly: 169.3, lz: -2704.5, ry: 0, rw: 0.999, pr: "-", id: guidsub });
-  await sleep(100);
-  emit(ws, "joinroom", { room: ROOM, v: "2.6.3", c: 3, m: "v", guid, guidsub });
-  await sleep(300);
-  emit(ws, "connectToRoom", ROOM);
-  await sleep(400);
-
-  const payload = {
-    nick: NICK + " [" + tStr + "]",
-    score: 999,
-    time: time,
-    str_time: tStr,
-    str_nick: NICK,
-    flag: FLAG_ID,
-    guid: guid,
-    rank: RANK_STR,
-    sid: deviceid,
-    m: "v",
-    installerName: "com.android.vending"
-  };
-  emit(ws, "levelcomplete", payload);
-  await sleep(200);
-  emit(ws, "newscore", payload);
-  console.log(">>> NEWSCORE SENT: " + time.toFixed(3) + "c");
-  await sleep(2000);
-  ws.close();
-}
-
-let autoCheckRunning = false;
-async function autoCheck() {
-  if (autoCheckRunning) return;
-  autoCheckRunning = true;
-  try {
-    const now = Date.now();
-    if (now - STATE.lastSent < COOLDOWN_MS) { autoCheckRunning = false; return; }
-    if (BEST_RECORD >= 999) { autoCheckRunning = false; return; }
-    let top = [];
-    try { top = await fetchTop(); } catch (e) { autoCheckRunning = false; return; }
-    let ourBest = Infinity, ourEntry = null;
-    for (const s of top) {
-      if (s && s.nick && s.nick.includes(NICK)) {
-        const tt = parseFloat(s.time);
-        if (!isNaN(tt) && tt < ourBest) { ourBest = tt; ourEntry = s; }
+function download(p) {
+  return new Promise(res => {
+    const url = "https://" + CDN + "/demos/" + p;
+    const req = https.get(url, { headers: { "User-Agent": "BestHTTP/2 v2.8.4" } }, r => {
+      if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) {
+        r.resume(); download(r.headers.location).then(res); return;
       }
-    }
-    if (ourEntry && ourBest <= BEST_RECORD) { STATE.lastSent = now; saveState(); autoCheckRunning = false; return; }
-    console.log("[AUTO] sending " + BEST_RECORD.toFixed(3) + "c");
-    await sendRecord(BEST_RECORD);
-    STATE.lastSent = now;
-    STATE.bestSent = BEST_RECORD;
-    saveState();
-  } catch (e) {}
-  autoCheckRunning = false;
+      if (r.statusCode !== 200) { r.resume(); res(null); return; }
+      const chunks = [];
+      r.on("data", c => chunks.push(c));
+      r.on("end", () => res(Buffer.concat(chunks)));
+    });
+    req.on("error", () => res(null));
+    req.setTimeout(15000, () => { req.destroy(); res(null); });
+  });
 }
 
-let DEMOS = [];
-for (let i = 0; i < 40; i++) {
-  try {
-    const d = JSON.parse(zlib.gunzipSync(fs.readFileSync("demo_" + i + ".gz")).toString("utf-8"));
-    const path = d.frames.map(f => ({ x: f.x/1e5, y: f.y/1e5, z: f.z/1e5, t: f.t }));
-    if (path.length < 5) continue;
-    DEMOS.push({ path, time: path[path.length-1].t });
-  } catch (e) {}
+async function collectDemos() {
+  console.log("=== сбор демок с CDN ===");
+  let have = 0;
+  const demos = [];
+  for (let round = 0; round < 20 && have < TARGET_DEMOS; round++) {
+    let scores = [];
+    try {
+      const guid = mkGuid(), guidsub = guid.substring(0,10);
+      const deviceid = "get_"+Date.now();
+      const ws = await connectWS("ws://"+ADDR+"/socket.io/?EIO=4&transport=websocket");
+      ws.on("message", raw => {
+        const m = raw.toString();
+        if (m === "2") { ws.send("3"); return; }
+        if (m.startsWith("42")) {
+          try {
+            const arr = JSON.parse(m.substring(2));
+            if (arr[0] === "scores" && arr[1] && arr[1].scores) scores = arr[1].scores;
+          } catch (e) {}
+        }
+      });
+      emit(ws,"register",{_id:"",deviceid,nick:"getter",coin:8400228,os:"Linux",installerName:"com.android.vending",sid:deviceid,version:APP_VER,dt:new Date().toISOString()});
+      await sleep(200);
+      emit(ws,"savedata",{_id:"",deviceid,nick:"getter",coin:8400228,os:"Linux",installerName:"com.android.vending",sid:deviceid,version:APP_VER,rank_id:RANK_ID,SelectedFlag:FLAG_ID,SelectedAvatar:AVATAR_ID,guid,userpin:0,refcode:"MVSFN7SE",FirstCase:"True",dt:new Date().toISOString()});
+      await sleep(200);
+      emit(ws,"playerinfo",{nick:"getter",rank_str:RANK_STR,cape_str:"cape-0",rank_id:RANK_ID,flag_id:FLAG_ID,avatar_id:AVATAR_ID,pr:"-",id:guidsub});
+      await sleep(100);
+      emit(ws,"move",{x:0,y:0,z:0,lx:0,ly:0,lz:0,ry:0,rw:0.999,pr:"-",id:guidsub});
+      await sleep(100);
+      emit(ws,"joinroom",{room:ROOM,v:APP_VER,c:3,m:"v",guid,guidsub});
+      await sleep(300);
+      emit(ws,"connectToRoom",ROOM);
+      await sleep(5000);
+      try { ws.close(); } catch(e) {}
+    } catch(e) { await sleep(2000); continue; }
+
+    console.log("round " + (round+1) + " — " + scores.length + " записей | у нас " + have + "/" + TARGET_DEMOS);
+    for (const s of scores) {
+      if (have >= TARGET_DEMOS) break;
+      if (!s.demoFile || !s.nick) continue;
+      if (demos.some(d => d.nick === s.nick)) continue;
+      const buf = await download(s.demoFile);
+      if (buf && buf.length > 100) {
+        try {
+          const d = JSON.parse(zlib.gunzipSync(buf).toString("utf-8"));
+          const path = d.frames.map(f => ({ x: f.x/1e5, y: f.y/1e5, z: f.z/1e5, t: f.t }));
+          if (path.length < 5) continue;
+          demos.push({ path, time: path[path.length-1].t, nick: s.nick });
+          have++;
+          console.log("  " + s.nick + " | " + s.time + " → " + have + "/" + TARGET_DEMOS);
+        } catch(e) {}
+      }
+      await sleep(300);
+    }
+  }
+  console.log("собрано: " + demos.length);
+  return demos;
 }
-if (!DEMOS.length) { console.log("no demos"); process.exit(1); }
-console.log("loaded " + DEMOS.length + " demos");
+
+let DEMOS = await collectDemos();
+if (!DEMOS.length) { console.log("нет демок — выход"); process.exit(1); }
 
 const minT = Math.min(...DEMOS.map(d => d.time));
 const maxT = Math.max(...DEMOS.map(d => d.time));
@@ -205,8 +168,8 @@ let B3=Array.from({length:OUT},()=>0);
 try {
   const w = JSON.parse(fs.readFileSync(WF, "utf-8"));
   W1=w.W1;B1=w.B1;W2=w.W2;B2=w.B2;W3=w.W3;B3=w.B3;
-  console.log("loaded weights");
-} catch (e) { console.log("fresh"); }
+  console.log("weights loaded");
+} catch (e) { console.log("fresh weights"); }
 
 function relu(x){ return x>0?x:0; }
 function fwd(inp) {
@@ -303,7 +266,7 @@ function train(epochs, lr){
   for (const d of DEMOS) for(let i=1;i<d.path.length-1;i++) {
     samples.push({ inp:mkIn(d.path[i].x,d.path[i].z,d.path[i-1].x,d.path[i-1].z), tgt:mkTgt(d.path[i].x,d.path[i].z,d.path[i+1].x,d.path[i+1].z), w:d.weight });
   }
-  console.log("training on " + samples.length + " samples x " + epochs);
+  console.log("train on " + samples.length + " samples x " + epochs);
   for(let ep=0;ep<epochs;ep++){
     let L=0;
     for(let i=samples.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[samples[i],samples[j]]=[samples[j],samples[i]];}
@@ -321,6 +284,104 @@ function rlUpdate(steps, reward, lr){
   }
 }
 
+async function fetchTop() {
+  const guid = mkGuid(), guidsub = guid.substring(0, 10);
+  const deviceid = "chk_" + Date.now();
+  const ws = await connectWS("ws://" + ADDR + "/socket.io/?EIO=4&transport=websocket");
+  let topScores = [];
+  ws.on("message", raw => {
+    const m = raw.toString();
+    if (m === "2") { ws.send("3"); return; }
+    if (m.startsWith("42")) {
+      try {
+        const arr = JSON.parse(m.substring(2));
+        if (arr[0] === "scores" && arr[1] && arr[1].scores) topScores = arr[1].scores;
+      } catch (e) {}
+    }
+  });
+  emit(ws, "register", { _id: "", deviceid, nick: "chk", coin: 8400228, os: "Linux", installerName: "com.android.vending", sid: deviceid, version: APP_VER, dt: new Date().toISOString() });
+  await sleep(200);
+  emit(ws, "savedata", { _id: "", deviceid, nick: "chk", coin: 8400228, os: "Linux", installerName: "com.android.vending", sid: deviceid, version: APP_VER, rank_id: RANK_ID, SelectedFlag: FLAG_ID, SelectedAvatar: AVATAR_ID, guid, userpin: 0, refcode: "MVSFN7SE", FirstCase: "True", dt: new Date().toISOString() });
+  await sleep(200);
+  emit(ws, "playerinfo", { nick: "chk", rank_str: RANK_STR, cape_str: "cape-0", rank_id: RANK_ID, flag_id: FLAG_ID, avatar_id: AVATAR_ID, pr: "-", id: guidsub });
+  await sleep(100);
+  emit(ws, "move", { x: 0, y: 0, z: 0, lx: 0, ly: 0, lz: 0, ry: 0, rw: 0.999, pr: "-", id: guidsub });
+  await sleep(100);
+  emit(ws, "joinroom", { room: ROOM, v: APP_VER, c: 3, m: "v", guid, guidsub });
+  await sleep(300);
+  emit(ws, "connectToRoom", ROOM);
+  await sleep(4000);
+  ws.close();
+  return topScores;
+}
+
+async function sendRecord(time) {
+  const guid = mkGuid(), guidsub = guid.substring(0, 10);
+  const deviceid = "rec_" + Date.now();
+  const ws = await connectWS("ws://" + ADDR + "/socket.io/?EIO=4&transport=websocket");
+  const tStr = String(Math.floor(time/60)).padStart(2,"0") + ":" + (time%60).toFixed(3).padStart(6,"0");
+
+  emit(ws, "register", { _id: "", deviceid, nick: NICK, coin: 8400228, os: "Linux", installerName: "com.android.vending", sid: deviceid, version: APP_VER, dt: new Date().toISOString() });
+  await sleep(200);
+  emit(ws, "savedata", { _id: "", deviceid, nick: NICK, coin: 8400228, os: "Linux", installerName: "com.android.vending", sid: deviceid, version: APP_VER, rank_id: RANK_ID, SelectedFlag: FLAG_ID, SelectedAvatar: AVATAR_ID, guid, userpin: 0, refcode: "MVSFN7SE", FirstCase: "True", dt: new Date().toISOString() });
+  await sleep(200);
+  emit(ws, "playerinfo", { nick: NICK, rank_str: RANK_STR, cape_str: "cape-0", rank_id: RANK_ID, flag_id: FLAG_ID, avatar_id: AVATAR_ID, pr: "-", id: guidsub });
+  await sleep(100);
+  emit(ws, "move", { x: 929.8, y: 169.3, z: -2704.5, lx: 929.8, ly: 169.3, lz: -2704.5, ry: 0, rw: 0.999, pr: "-", id: guidsub });
+  await sleep(100);
+  emit(ws, "joinroom", { room: ROOM, v: APP_VER, c: 3, m: "v", guid, guidsub });
+  await sleep(300);
+  emit(ws, "connectToRoom", ROOM);
+  await sleep(400);
+
+  const payload = {
+    nick: NICK + " [" + tStr + "]",
+    score: 999,
+    time: time,
+    str_time: tStr,
+    str_nick: NICK,
+    flag: FLAG_ID,
+    guid: guid,
+    rank: RANK_STR,
+    sid: deviceid,
+    m: "v",
+    installerName: "com.android.vending"
+  };
+  emit(ws, "levelcomplete", payload);
+  await sleep(200);
+  emit(ws, "newscore", payload);
+  console.log(">>> NEWSCORE SENT: " + time.toFixed(3) + "c");
+  await sleep(2000);
+  ws.close();
+}
+
+let autoCheckRunning = false;
+async function autoCheck() {
+  if (autoCheckRunning) return;
+  autoCheckRunning = true;
+  try {
+    const now = Date.now();
+    if (now - STATE.lastSent < COOLDOWN_MS) { autoCheckRunning = false; return; }
+    if (BEST_RECORD >= 999) { autoCheckRunning = false; return; }
+    let top = [];
+    try { top = await fetchTop(); } catch (e) { autoCheckRunning = false; return; }
+    let ourBest = Infinity, ourEntry = null;
+    for (const s of top) {
+      if (s && s.nick && s.nick.includes(NICK)) {
+        const tt = parseFloat(s.time);
+        if (!isNaN(tt) && tt < ourBest) { ourBest = tt; ourEntry = s; }
+      }
+    }
+    if (ourEntry && ourBest <= BEST_RECORD) { STATE.lastSent = now; saveState(); autoCheckRunning = false; return; }
+    console.log("[AUTO] отправка " + BEST_RECORD.toFixed(3) + "c");
+    await sendRecord(BEST_RECORD);
+    STATE.lastSent = now;
+    STATE.bestSent = BEST_RECORD;
+    saveState();
+  } catch (e) {}
+  autoCheckRunning = false;
+}
+
 async function runBot(){
   const guid=mkGuid(),guidsub=guid.substring(0,10);
   const deviceid="a_"+Date.now()+"_"+Math.random().toString(36).substring(2,6);
@@ -332,15 +393,15 @@ async function runBot(){
 
   try{
     const ws=await connectWS("ws://"+ADDR+"/socket.io/?EIO=4&transport=websocket");
-    emit(ws,"register",{_id:"",deviceid,nick:NICK,coin:8400228,os:"Linux",installerName:"com.android.vending",sid:deviceid,version:"2.6.3",dt:new Date().toISOString()});
+    emit(ws,"register",{_id:"",deviceid,nick:NICK,coin:8400228,os:"Linux",installerName:"com.android.vending",sid:deviceid,version:APP_VER,dt:new Date().toISOString()});
     await sleep(20);
-    emit(ws,"savedata",{_id:"",deviceid,nick:NICK,coin:8400228,os:"Linux",installerName:"com.android.vending",sid:deviceid,version:"2.6.3",rank_id:RANK_ID,SelectedFlag:FLAG_ID,SelectedAvatar:AVATAR_ID,guid,userpin:0,refcode:"MVSFN7SE",FirstCase:"True",dt:new Date().toISOString()});
+    emit(ws,"savedata",{_id:"",deviceid,nick:NICK,coin:8400228,os:"Linux",installerName:"com.android.vending",sid:deviceid,version:APP_VER,rank_id:RANK_ID,SelectedFlag:FLAG_ID,SelectedAvatar:AVATAR_ID,guid,userpin:0,refcode:"MVSFN7SE",FirstCase:"True",dt:new Date().toISOString()});
     await sleep(20);
     emit(ws,"playerinfo",{nick:NICK,rank_str:RANK_STR,cape_str:"cape-0",rank_id:RANK_ID,flag_id:FLAG_ID,avatar_id:AVATAR_ID,pr:"-",id:guidsub});
     await sleep(20);
     emit(ws,"move",{x:pos.x,y:pos.y,z:pos.z,lx:pos.x,ly:pos.y,lz:pos.z,ry:0,rw:1,pr:"-",id:guidsub});
     await sleep(30);
-    emit(ws,"joinroom",{room:ROOM,v:"2.6.3",c:3,m:"v",guid,guidsub});
+    emit(ws,"joinroom",{room:ROOM,v:APP_VER,c:3,m:"v",guid,guidsub});
     await sleep(50);
     emit(ws,"connectToRoom",ROOM);
     await sleep(100);
@@ -374,6 +435,9 @@ async function runBot(){
         if(!found){ fell=true; break; }
       }
 
+      const oldX = pos.x, oldY = pos.y, oldZ = pos.z;
+      const oldRotY = rotY;
+
       episodeSteps.push({
         inp,
         action: [dx/(SPEED*Math.SQRT2), dz/(SPEED*Math.SQRT2)],
@@ -383,15 +447,33 @@ async function runBot(){
       prev={x:pos.x,z:pos.z};
       pos.x=nx; pos.z=nz;
       pos.y=getY(pos.x,pos.z);
-      if(Math.abs(dx)>0.05||Math.abs(dz)>0.05) rotY=Math.atan2(dx,dz);
 
-      emit(ws,"move",{x:pos.x,y:pos.y,z:pos.z,lx:pos.x,ly:pos.y,lz:pos.z,ry:rotY,rw:1,pr:"-",id:guidsub});
+      const targetYaw = Math.atan2(dx, dz);
+      let dyaw = targetYaw - rotY;
+      while (dyaw > Math.PI) dyaw -= 2*Math.PI;
+      while (dyaw < -Math.PI) dyaw += 2*Math.PI;
+      const MAX_TURN = 0.20;
+      if (Math.abs(dyaw) > MAX_TURN) dyaw = Math.sign(dyaw) * MAX_TURN;
+      rotY += dyaw;
+
+      for (let s = 1; s <= SUBSTEPS; s++) {
+        const k = s / SUBSTEPS;
+        const ix = oldX + (pos.x - oldX) * k;
+        const iy = oldY + (pos.y - oldY) * k;
+        const iz = oldZ + (pos.z - oldZ) * k;
+        const iYaw = oldRotY + (rotY - oldRotY) * k;
+        const qy = Math.sin(iYaw / 2);
+        const qw = Math.cos(iYaw / 2);
+        const lx = ix + Math.sin(iYaw) * 1.5;
+        const lz = iz + Math.cos(iYaw) * 1.5;
+        emit(ws, "move", { x: ix, y: iy, z: iz, lx: lx, ly: iy, lz: lz, ry: qy, rw: qw, pr: "-", id: guidsub });
+        await sleep(10);
+      }
 
       const dist3=Math.hypot(pos.x-FINISH.x,pos.y-FINISH.y,pos.z-FINISH.z);
       if(dist3<3){ done=true; break; }
       if(step%25===0) console.log("step "+step+" pos=("+pos.x.toFixed(1)+","+pos.z.toFixed(1)+") dist="+dist3.toFixed(1));
       step++;
-      await sleep(80);
     }
     ws.close();
     const elapsed = (Date.now()-t0)/1000;
@@ -400,9 +482,9 @@ async function runBot(){
 }
 
 (async()=>{
-  console.log("=== " + NICK + " ===");
+  console.log("=== " + NICK + " — 60 pkt/s, плавно, камера по движению ===");
   if(!fs.existsSync(WF)){
-    console.log("no weights, first train 200 epochs...");
+    console.log("no weights, train 200 epochs...");
     train(200, 0.003);
   } else {
     console.log("weights loaded");
@@ -432,7 +514,15 @@ async function runBot(){
       }
       if (r.elapsed < BEST_RECORD) {
         BEST_RECORD = r.elapsed;
-        saveTop(r.elapsed, r.steps);
+        try {
+          fs.writeFileSync(RECORD_FILE, r.elapsed.toFixed(3));
+          let content = r.elapsed.toFixed(3) + "c\n";
+          for (let i = 0; i < r.steps.length; i++) {
+            const s = r.steps[i];
+            content += "[" + (i+1) + "] t=" + (i*0.08).toFixed(2) + "s x=" + (s.posX||0).toFixed(2) + " y=" + (s.posY||0).toFixed(2) + " z=" + (s.posZ||0).toFixed(2) + "\n";
+          }
+          fs.writeFileSync(TOP_FILE, content);
+        } catch(e) {}
         console.log(">>> NEW ALL-TIME RECORD! " + r.elapsed.toFixed(3) + "c");
       }
       console.log(">>> FINISH! time=" + r.elapsed.toFixed(2) + "s reward=" + reward.toFixed(1) + " best=" + bestTime.toFixed(2) + (doRL?" [RL]":""));
@@ -447,12 +537,12 @@ async function runBot(){
     }
 
     if (fails >= MAX_FAILS) {
-      console.log("!!! " + MAX_FAILS + " FAILS IN A ROW → ROLLBACK");
+      console.log("!!! " + MAX_FAILS + " FAILS → ROLLBACK");
       if (loadBackup()) {
         fails = 0;
-        console.log(">>> weights restored, continuing...");
+        console.log(">>> weights restored");
       } else {
-        console.log(">>> no backup, retraining...");
+        console.log(">>> no backup, retrain...");
         train(50, 0.002);
         saveBackup();
         fails = 0;
